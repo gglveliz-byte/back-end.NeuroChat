@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Environment variables (NEVER commit)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Uploads (user data)
+uploads/
+storage/
+
+# Build / temp
+dist/
+build/
+tmp_excel.json
+whisper_result.json
+compact_transcript.txt
+*.log
+npm-debug.log*
+
+# Test output
+test-output/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+nul
+*.tmp
+*.txt
+*.py
