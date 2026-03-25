@@ -59,6 +59,7 @@ const productRoutes = require('./routes/product');
 const voiceRoutes = require('./routes/voice');
 const b2bRoutes = require('./routes/b2b');
 const b2bWebRoutes = require('./routes/b2bWeb');
+const notificationRoutes = require('./routes/notification');
 
 // Middlewares
 const { apiLimiter } = require('./middlewares/rateLimiter');
@@ -216,6 +217,7 @@ app.use('/api/v1/store', require('./routes/store'));
 app.use('/api/v1/voice', voiceRoutes);
 app.use('/api/v1/b2b', b2bRoutes);
 app.use('/api/v1/b2b-web', b2bWebRoutes);
+app.use('/api/v1/notification', notificationRoutes);
 
 // Ruta para servicios disponibles (pública)
 app.get('/api/v1/services', publicServiceController.getServices);

@@ -6,7 +6,7 @@ exports.up = async () => {
         CREATE TABLE IF NOT EXISTS notifications (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             recipient_type VARCHAR(10) NOT NULL CHECK (recipient_type IN ('client', 'admin', 'b2b')),
-            recipient_id UUID NOT NULL,
+            recipient_id VARCHAR(255) NOT NULL,
             type VARCHAR(100) NOT NULL,
             title VARCHAR(255) NOT NULL,
             body TEXT,
