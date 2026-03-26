@@ -13,6 +13,7 @@ const { sendDailyLimitReachedEmail, sendHumanAttentionEmail, sendSubscriptionExp
 const { recordTokenUsage, processPaygResponse, checkBalance } = require('../services/billingService');
 const { transcribeAudio, downloadTelegramAudio, downloadAudioFromUrl } = require('../services/audioService');
 const { PAYG } = require('../config/constants');
+const { NotificationRecipientTypes, NotificationTypes } = require('../enums/notificationTypes');
 
 const GRAPH_API = 'https://graph.facebook.com/v21.0';
 
@@ -116,6 +117,19 @@ async function checkAndHandleExpiration(serviceData) {
         serviceData.service_name,
         20
       ).catch(err => console.error('Error enviando email de expiración:', err.message));
+      try {
+        notificationService.createNotification({
+          recipient_type: NotificationRecipientTypes.CLIENT,
+          recipient_id: serviceData.client_id,
+          type: NotificationTypes.SUBSCRIPTION_EXPIRED,
+          title: '¡Suscripción!',
+          body: `Tu suscripción de ${serviceData.service_name} ha expirado.`,
+          path: 'client/services',
+          data: serviceData
+        });
+      } catch (error) {
+        console.error(`❌ Error al crear notificación ${NotificationTypes.SUBSCRIPTION_EXPIRED}:`, error);
+      }
     }
   } catch (err) {
     console.error('Error marcando servicio como expirado:', err.message);
@@ -310,6 +324,19 @@ async function generateAndSendBotResponse({
         serviceLimitCheck.limit,
         serviceLimitCheck.status
       ).catch(err => console.error('Error enviando email de límite:', err));
+      try {
+        notificationService.createNotification({
+          recipient_type: NotificationRecipientTypes.CLIENT,
+          recipient_id: serviceData.client_id,
+          type: NotificationTypes.SEND_DAILY_LIMIT_REACHED,
+          title: '¡Límite de Mensajes Alcanzado!',
+          body: `Tu servicio ${service_name} ha alcanzado el límite de mensajes diario.`,
+          path: 'client/services',
+          data: clientInfo.rows[0]
+        });
+      } catch (error) {
+        console.error(`❌ Error al crear notificación ${NotificationTypes.SEND_DAILY_LIMIT_REACHED}:`, error);
+      }
     }
 
     return { response: maintenanceMsg, isServiceLimit: true };
@@ -384,6 +411,19 @@ async function generateAndSendBotResponse({
         platform,
         conversationId
       }).catch(err => console.error('Error enviando email de atención humana:', err));
+      try {
+        notificationService.createNotification({
+          recipient_type: NotificationRecipientTypes.CLIENT,
+          recipient_id: serviceData.client_id,
+          type: NotificationTypes.SEND_HUMAN_ATTENTION,
+          title: '¡Atención Humana Requerida!',
+          body: `Un cliente necesita hablar contigo en ${platform} ahora mismo.`,
+          path: '',
+          data: clientInfo.rows[0]
+        });
+      } catch (error) {
+        console.error(`❌ Error al crear notificación ${NotificationTypes.SEND_HUMAN_ATTENTION}:`, error);
+      }
     }
 
     return { response: handoverMsg, isHandover: true };
@@ -563,6 +603,19 @@ async function generateAndSendBotResponse({
           platform,
           conversationId
         }).catch(err => console.error('Error enviando email de atención humana (basic):', err));
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: serviceData.client_id,
+            type: NotificationTypes.SEND_HUMAN_ATTENTION,
+            title: '¡Atención Humana Requerida!',
+            body: `Un cliente necesita hablar contigo en ${platform} ahora mismo.`,
+            path: '',
+            data: clientInfoBasic.rows[0]
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.SEND_HUMAN_ATTENTION}:`, error);
+        }
       }
     }
   }
@@ -1569,14 +1622,27 @@ const sendWebChatMessage = async (req, res) => {
           if (updated.rows.length > 0) {
             // Obtener email del cliente para notificar
             const clientRow = await query(
-              `SELECT c.email, c.name, s.name as service_name FROM clients c
+              `SELECT c.id as client_id, c.email, c.name, s.name as service_name FROM clients c
                JOIN client_services cs ON c.id = cs.client_id
                JOIN services s ON cs.service_id = s.id
                WHERE cs.id = $1`, [conversation.client_service_id]
             );
             if (clientRow.rows.length > 0) {
-              const { email, name, service_name } = clientRow.rows[0];
+              const { client_id, email, name, service_name } = clientRow.rows[0];
               await sendSubscriptionExpiredEmail(email, name, service_name, 20).catch(() => { });
+              try {
+                notificationService.createNotification({
+                  recipient_type: NotificationRecipientTypes.CLIENT,
+                  recipient_id: client_id,
+                  type: NotificationTypes.SUBSCRIPTION_EXPIRED,
+                  title: '¡Suscripción!',
+                  body: `Tu suscripción de ${service_name} ha expirado.`,
+                  path: 'client/services',
+                  data: clientRow.rows[0]
+                });
+              } catch (error) {
+                console.error(`❌ Error al crear notificación ${NotificationTypes.SUBSCRIPTION_EXPIRED}:`, error);
+              }
             }
           }
         } catch (err) {
@@ -1625,12 +1691,25 @@ const sendWebChatMessage = async (req, res) => {
 
           // Enviar email al cliente
           const clientInfo = await query(
-            'SELECT c.email, c.name, s.name as service_name FROM clients c JOIN client_services cs ON c.id = cs.client_id JOIN services s ON cs.service_id = s.id WHERE cs.id = $1',
+            'SELECT c.id as client_id, c.email, c.name, s.name as service_name FROM clients c JOIN client_services cs ON c.id = cs.client_id JOIN services s ON cs.service_id = s.id WHERE cs.id = $1',
             [conversation.client_service_id]
           );
           if (clientInfo.rows.length > 0) {
-            const { email, name, service_name } = clientInfo.rows[0];
+            const { client_id, email, name, service_name } = clientInfo.rows[0];
             sendDailyLimitReachedEmail(email, name, service_name, serviceLimitCheck.limit, serviceLimitCheck.status).catch(err => console.error('Error enviando email:', err));
+            try {
+              notificationService.createNotification({
+                recipient_type: NotificationRecipientTypes.CLIENT,
+                recipient_id: client_id,
+                type: NotificationTypes.SEND_DAILY_LIMIT_REACHED,
+                title: '¡Límite de Mensajes Alcanzado!',
+                body: `Tu servicio ${service_name} ha alcanzado el límite de mensajes diario.`,
+                path: 'client/services',
+                data: clientInfo.rows[0]
+              });
+            } catch (error) {
+              console.error(`❌ Error al crear notificación ${NotificationTypes.SEND_DAILY_LIMIT_REACHED}:`, error);
+            }
           }
 
           return res.json({ success: true, data: { userMessage: userMsgResult.rows[0], reply: maintenanceMsg } });
@@ -1748,13 +1827,26 @@ const sendWebChatMessage = async (req, res) => {
           setImmediate(async () => {
             try {
               const clientInfo = await query(
-                'SELECT c.email, c.name FROM clients c WHERE c.id = $1',
+                'SELECT c.id as client_id, c.email, c.name FROM clients c WHERE c.id = $1',
                 [conversation.client_id]
               );
               if (clientInfo.rows.length > 0) {
-                const { email, name } = clientInfo.rows[0];
+                const { client_id, email, name } = clientInfo.rows[0];
                 const visitorContact = updatedConv.rows[0]?.contact_phone || updatedConv.rows[0]?.contact_email || 'Sin contacto';
-                await sendHumanAttentionEmail(email, name, `${visitorName} (${visitorContact})`, 'webchat', conversationId).catch(() => {});
+                await sendHumanAttentionEmail(email, name, `${visitorName} (${visitorContact})`, 'webchat', conversationId).catch(() => { });
+                try {
+                  notificationService.createNotification({
+                    recipient_type: NotificationRecipientTypes.CLIENT,
+                    recipient_id: client_id,
+                    type: NotificationTypes.SEND_HUMAN_ATTENTION,
+                    title: '¡Atención Humana Requerida!',
+                    body: `Un cliente necesita hablar contigo en ${platform} ahora mismo.`,
+                    path: '',
+                    data: clientInfo.rows[0]
+                  });
+                } catch (error) {
+                  console.error(`❌ Error al crear notificación ${NotificationTypes.SEND_HUMAN_ATTENTION}:`, error);
+                }
               }
             } catch (err) {
               console.error('[Webchat] Error enviando email de atención humana:', err.message);

@@ -644,15 +644,19 @@ const validatePayment = async (req, res) => {
       if (clientInfo.rows.length > 0) {
         const { email, name, service_name } = clientInfo.rows[0];
         sendPaymentConfirmedEmail(email, name, service_name, payment.amount);
-        notificationService.createNotification({
-          recipient_type: NotificationRecipientTypes.CLIENT,  
-          recipient_id: clientInfo.rows[0].id, 
-          type: NotificationTypes.PAYMENT_CONFIRMED,
-          title: '✅ Pago confirmado',
-          body: 'Tu pago ha sido confirmado exitosamente.',
-          path: '/client/payments', 
-          data: clientInfo.rows[0] 
-        });
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: clientInfo.rows[0].id,
+            type: NotificationTypes.PAYMENT_CONFIRMED,
+            title: '¡Pago confirmado!',
+            body: 'Tu pago ha sido confirmado exitosamente.',
+            path: '/client/payments',
+            data: clientInfo.rows[0]
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.PAYMENT_CONFIRMED}:`, error);
+        }
       }
     }
 
@@ -1697,6 +1701,19 @@ const activateVoiceNumber = async (req, res) => {
           clientName: row.client_name,
           whatsappPhone: row.whatsapp_phone,
         }).catch(() => { });
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: clientServiceId,
+            type: NotificationTypes.VOICE_ACTIVATED,
+            title: '¡Tu Voz IA está activa!',
+            body: 'Tu número ya responde llamadas automáticamente.',
+            path: '',
+            data: row
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.VOICE_ACTIVATED}:`, error);
+        }
       });
     }
 
