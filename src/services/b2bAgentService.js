@@ -820,7 +820,7 @@ async function _callReprocessAI(text, agentOrCriteria, previousResult, humanFeed
       ? previousResult.criterios.filter(c => lockedIds.includes(Number(c.id)))
       : [];
     const lockedBlock = lockedCrits.map(c =>
-      `- Criterio ${c.id} (${c.nombre || ''}): CONFIRMADO CORRECTO — mantén EXACTAMENTE: ${c.cumple ? 'CUMPLE' : 'NO CUMPLE'} / ${c.puntaje}pts`
+      `- Criterio ${c.id} (${c.nombre || ''}): Ya validado como ${c.cumple ? 'CUMPLE' : 'NO CUMPLE'}`
     ).join('\n');
 
     const corrBlock = correctionItems.map(ci => {
@@ -830,14 +830,15 @@ async function _callReprocessAI(text, agentOrCriteria, previousResult, humanFeed
 
     contextMessage = `MODO: REPROCESO QUIRÚRGICO${chunkLabel}
 
-CRITERIOS BLOQUEADOS (validados como correctos por el revisor — NO CAMBIES su calificación):
+CRITERIOS CONTEXTUALES (ya validados, tomalos solo como contexto):
 ${lockedBlock || '(ninguno)'}
 
-CRITERIOS A RE-EVALUAR (solo estos):
+CRITERIOS A RE-EVALUAR:
 ${corrBlock || '(ninguno)'}
 
-Para los criterios bloqueados, copia exactamente la calificación anterior.
-Para los criterios a re-evaluar, analiza la transcripción con la observación del revisor y emite nueva calificación.
+INSTRUCCIÓN MUY IMPORTANTE: NO incluyas los criterios contextuales en tu respuesta JSON.
+Tu matriz de "criterios" en el JSON final SOLO DEBE CONTENER los criterios a re-evaluar. 
+Analiza la transcripción con la observación del revisor y emite la nueva calificación únicamente para ellos.
 
 Interacción:
 ${text}`;
