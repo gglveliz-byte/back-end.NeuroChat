@@ -5,6 +5,8 @@ const {
   sendSubscriptionExpiredEmail
 } = require('../services/emailService');
 
+const { NotificationRecipientTypes, NotificationTypes } = require('../enums/notificationTypes');
+
 // =====================================================
 // JOB: Expiración automática de trials y suscripciones
 // =====================================================
@@ -77,6 +79,19 @@ async function notifyExpiringTrials() {
           daysLeft,
           trial.service_name
         );
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: trial.client_id,
+            type: NotificationTypes.TRIAL_EXPIRING,
+            title: '¡Período de prueba a punto de finalizar!',
+            body: `Te recordamos que tu período de prueba de ${trial.service_name} está por finalizar`,
+            path: '',
+            data: trial
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.TRIAL_EXPIRING}:`, error);
+        }
       }
     }
 
@@ -123,6 +138,19 @@ async function notifyExpiringSubscriptions() {
           sub.service_name,
           sub.price_monthly
         );
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: sub.client_id,
+            type: NotificationTypes.SUBSCRIPTION_EXPIRING,
+            title: '¡Suscripción!',
+            body: `Tu suscripción de ${sub.service_name} está por vencer.`,
+            path: 'client/services',
+            data: sub
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.SUBSCRIPTION_EXPIRING}:`, error);
+        }
       }
     } else {
       console.log('✅ [CRON] No hay suscripciones por vencer');
@@ -179,6 +207,19 @@ async function expireSubscriptions() {
           sub.service_name,
           sub.price_monthly
         );
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: sub.client_id,
+            type: NotificationTypes.SUBSCRIPTION_EXPIRED,
+            title: '¡Suscripción!',
+            body: `Tu suscripción de ${sub.service_name} ha expirado.`,
+            path: 'client/services',
+            data: sub
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.SUBSCRIPTION_EXPIRED}:`, error);
+        }
       }
     } else {
       console.log('✅ [CRON] No hay suscripciones vencidas');

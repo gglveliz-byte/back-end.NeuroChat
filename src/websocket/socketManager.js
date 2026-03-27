@@ -26,10 +26,11 @@ function initializeWebSocket(io) {
       }
 
       socket.userData = {
-        id: decoded.id,
+        id: decoded.sub,
         type: decoded.type, // 'client' o 'admin'
         email: decoded.email
       };
+          console.log('USER DATA:', socket.userData);
 
       next();
     } catch (error) {
@@ -40,6 +41,17 @@ function initializeWebSocket(io) {
   });
 
   io.on('connection', (socket) => {
+
+    // =====================================================
+    // ROOM PARA NOTIFICACIONES
+    // =====================================================
+
+    if (socket.userData?.id && socket.userData?.type !== 'guest') {
+      const room = `${socket.userData.type}:${socket.userData.id}`;
+      socket.join(room);
+      console.log('ROOM:', room);
+    } 
+
     // ===== UNIRSE A SALA DE SERVICIO =====
     // El cliente se une a una sala para recibir mensajes de ese servicio
     socket.on('join_service', async (data) => {
@@ -241,6 +253,16 @@ function getIO() {
   return ioInstance;
 }
 
+/**
+ * Emitir notificación a un usuario específico
+ */
+function emitNotification(recipientType, recipientId, data) {
+  if (!ioInstance) return;
+
+  const room = `${recipientType}:${recipientId}`;
+  ioInstance.to(room).emit('notification:new', data);
+}
+
 module.exports = {
   initializeWebSocket,
   emitNewMessage,
@@ -250,5 +272,6 @@ module.exports = {
   emitBotToggle,
   emitHumanAttention,
   emitOrderVoucherReceived,
-  getIO
+  getIO,
+  emitNotification
 };
