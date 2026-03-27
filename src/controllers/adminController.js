@@ -650,7 +650,7 @@ const validatePayment = async (req, res) => {
     // Si se aprobó, enviar email de confirmación
     if (approved) {
       const clientInfo = await query(`
-        SELECT c.email, c.name, s.name as service_name
+        SELECT c.id, c.email, c.name, s.name as service_name
         FROM clients c
         JOIN client_services cs ON c.id = cs.client_id
         JOIN services s ON cs.service_id = s.id
@@ -660,6 +660,19 @@ const validatePayment = async (req, res) => {
       if (clientInfo.rows.length > 0) {
         const { email, name, service_name } = clientInfo.rows[0];
         sendPaymentConfirmedEmail(email, name, service_name, payment.amount);
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: clientInfo.rows[0].id,
+            type: NotificationTypes.PAYMENT_CONFIRMED,
+            title: '¡Pago confirmado!',
+            body: 'Tu pago ha sido confirmado exitosamente.',
+            path: '/client/payments',
+            data: clientInfo.rows[0]
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.PAYMENT_CONFIRMED}:`, error);
+        }
       }
     }
 
@@ -1272,6 +1285,7 @@ const updateMessagingProvider = async (req, res) => {
 // CRON JOBS - Ejecución manual desde admin panel
 // =====================================================
 const { runJobManually } = require('../jobs');
+const NotificationTypes = require('../enums/notificationTypes');
 
 const runCronJob = async (req, res) => {
   try {
@@ -1502,7 +1516,7 @@ const fixPlatformCredential = async (req, res) => {
 const getBillingOverview = async (req, res) => {
   try {
     const now = new Date();
-    const year  = parseInt(req.query.year  || now.getFullYear());
+    const year = parseInt(req.query.year || now.getFullYear());
     const month = parseInt(req.query.month || now.getMonth() + 1);
 
     const summary = await getAllClientsUsageSummary(year, month);
@@ -1540,7 +1554,7 @@ const getClientBillingDetail = async (req, res) => {
   try {
     const { clientId } = req.params;
     const now = new Date();
-    const year  = parseInt(req.query.year  || now.getFullYear());
+    const year = parseInt(req.query.year || now.getFullYear());
     const month = parseInt(req.query.month || now.getMonth() + 1);
 
     const usage = await getMonthlyUsage(clientId, year, month);
@@ -1582,7 +1596,7 @@ const updateServicePaygPricing = async (req, res) => {
       });
     }
 
-    const inputRate  = parseFloat(input_price_per_1k);
+    const inputRate = parseFloat(input_price_per_1k);
     const outputRate = parseFloat(output_price_per_1k);
 
     if (isNaN(inputRate) || isNaN(outputRate) || inputRate <= 0 || outputRate <= 0) {
@@ -1708,7 +1722,20 @@ const activateVoiceNumber = async (req, res) => {
         sendVoiceActivatedEmail(row.client_email, {
           clientName: row.client_name,
           whatsappPhone: row.whatsapp_phone,
-        }).catch(() => {});
+        }).catch(() => { });
+        try {
+          notificationService.createNotification({
+            recipient_type: NotificationRecipientTypes.CLIENT,
+            recipient_id: clientServiceId,
+            type: NotificationTypes.VOICE_ACTIVATED,
+            title: '¡Tu Voz IA está activa!',
+            body: 'Tu número ya responde llamadas automáticamente.',
+            path: '',
+            data: row
+          });
+        } catch (error) {
+          console.error(`❌ Error al crear notificación ${NotificationTypes.VOICE_ACTIVATED}:`, error);
+        }
       });
     }
 
