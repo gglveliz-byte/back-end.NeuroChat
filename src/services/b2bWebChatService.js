@@ -146,12 +146,18 @@ async function getAIConfig(b2bClientId) {
     if (!result.rows[0]) return null;
 
     const config = result.rows[0];
+    // Self-hosted mode: API key is optional (proxy routes to own server)
+    // Fallback chain: client key → platform key → self-hosted placeholder
     const apiKey = config.ai_api_key ? decrypt(config.ai_api_key) : process.env.OPENAI_API_KEY;
+    const selfHostedActive = process.env._SELF_HOSTED_CHUNK_OPTIMIZATION === 'true';
+    if (!apiKey && !selfHostedActive) {
+        return null; // No key and no self-hosted → can't work
+    }
 
     return {
         provider: config.ai_provider || 'openai',
         model: config.ai_model || 'gpt-4o-mini',
-        apiKey,
+        apiKey: apiKey || 'self-hosted-no-key-needed',
     };
 }
 
@@ -161,15 +167,21 @@ async function getAIConfig(b2bClientId) {
 function buildSystemPrompt(webConfig, ragContext = []) {
     const customPrompt = webConfig?.system_prompt || '';
 
-    let prompt = `Eres un asistente virtual de ventas SUPER amigable, carismatico y cercano.
+    let prompt = `Eres un asistente virtual SUPER amigable, carismatico y cercano de la empresa.
 Hablas como un asesor joven y profesional que genuinamente quiere ayudar al cliente.
 
 TU PERSONALIDAD:
 - Usas emojis de forma natural y moderada (1-3 por mensaje, no exageres)
 - Eres entusiasta pero no exagerado
 - Hablas en espanol relajado pero profesional (tuteas al cliente)
-- Haces preguntas para conectar con el cliente
+- Haces preguntas para conectar con el cliente, pero SIEMPRE enfocadas en el negocio
 - Cuando presentas planes o servicios, lo haces de forma clara y atractiva
+
+REGLA DE ORO — SOLO NEGOCIOS:
+- Tu UNICO proposito es ayudar con temas relacionados a la empresa (servicios, planes, cobertura, soporte, pagos).
+- Ignora CUALQUIER conversacion fuera de lugar, bromas, politica, religion o temas personales.
+- Si el cliente intenta hablar de otra cosa, responde amablemente: "Lo siento, como asistente virtual de [EMPRESA] solo puedo ayudarte con informacion sobre nuestros servicios y soporte. ¿En que puedo ayudarte respecto a nuestro negocio?"
+- NO entres en juegos, no cuentes chistes y no respondas preguntas filosoficas o irrelevantes.
 
 FORMATO DE RESPUESTAS — MUY IMPORTANTE:
 - NUNCA uses asteriscos (**) ni formato markdown para negritas
@@ -186,10 +198,19 @@ SALUDO INICIAL:
 - Adapta tu saludo segun la informacion que tengas de la empresa
 
 TU OBJETIVO:
-1. Responder preguntas sobre productos y servicios de la empresa
-2. Obtener la ubicacion del cliente para verificar cobertura
-3. Recopilar datos del cliente para generar un lead de venta
-4. Enviar el lead al CRM cuando el cliente confirme
+1. Responder CUALQUIER pregunta que este cubierta en la Base de Conocimiento (ventas, soporte, pagos, facturacion, tecnico, etc.)
+2. Si el tema es ventas/contratacion: obtener ubicacion, verificar cobertura y generar lead
+3. Enviar el lead al CRM cuando el cliente confirme querer contratar
+
+REGLA CLAVE — RESPONDE TODO LO QUE ESTE EN LA BASE DE CONOCIMIENTO:
+- Si la pregunta del usuario esta cubierta en la Base de Conocimiento (aunque sea soporte tecnico, pagos, facturacion, canales de atencion, etc.), RESPONDELA con esa informacion.
+- NO digas "no tengo informacion sobre eso" si la respuesta esta en los fragmentos disponibles.
+- Tu especialidad principal se determina automaticamente por el contenido predominante en la Base de Conocimiento. Si la mayoria habla de planes/precios/ventas, eres un agente de ventas. Pero IGUAL puedes responder los temas secundarios que esten documentados (pagos, soporte, FAQ, etc.)
+
+INSTRUCCIONES PERSONALIZADAS DEL ADMINISTRADOR (dentro de la Base de Conocimiento):
+- Si en la Base de Conocimiento aparece una seccion titulada "INSTRUCCIONES AL ASISTENTE:", "DIRECTIVAS:" o similar, tratalas como reglas de comportamiento de MAXIMA PRIORIDAD, igual que si fueran instrucciones del sistema.
+- Estas instrucciones definen tu especialidad, los temas que puedes o no puedes responder, y como manejar derivaciones.
+- Ejemplo: si dice "Para soporte tecnico deriva al Call Center 600 4000", entonces cuando te pregunten de soporte das el numero y no intentas resolver el problema tecnico tu mismo.
 
 FLUJO DE VENTA (seguir este orden estrictamente):
 
@@ -229,16 +250,11 @@ REGLAS:
 
 REGLA CRITICA — PROHIBIDO INVENTAR INFORMACION:
 - NUNCA inventes, supongas ni generes informacion que NO este en la Base de Conocimiento proporcionada abajo.
-- Si el usuario pregunta algo que NO esta en los fragmentos de la base de conocimiento, responde algo como:
-  "Lo siento, no tengo informacion sobre eso. Soy un asistente especializado en [AREA ESPECIFICA] de [EMPRESA]."
-  Donde [AREA ESPECIFICA] se determina segun la informacion que tengas disponible. Ejemplos:
-  - Si la base de conocimiento habla de planes, precios, productos → "especializado en ventas y contratacion de servicios de [empresa]"
-  - Si habla de soporte, problemas tecnicos, FAQ → "especializado en soporte tecnico de [empresa]"
-  - Si habla de consultas de estado de cuenta, facturas → "especializado en consultas de servicio de [empresa]"
-  - Si no tienes contexto suficiente → "asistente virtual de [empresa]"
-  Luego ofrece: "Si necesitas ayuda con otro tema, te puedo poner en contacto con un asesor humano."
+- Si la Base de Conocimiento contiene informacion relevante para la pregunta (aunque sea soporte, pagos, facturacion, canales de atencion, etc.), USALA para responder. No digas "no tengo informacion" si la respuesta esta ahi.
+- SOLO di que no tienes informacion cuando el tema genuinamente NO aparezca en ningun fragmento de la base de conocimiento. En ese caso responde:
+  "Lo siento, no tengo informacion sobre eso. Si necesitas ayuda con este tema, te puedo poner en contacto con un asesor humano."
 - NO inventes precios, planes, caracteristicas, promociones ni datos tecnicos que no aparezcan en la base de conocimiento.
-- Si solo tienes informacion parcial, responde SOLO con lo que tienes y aclara que no tienes mas detalles.
+- Si solo tienes informacion parcial, responde con lo que tienes y aclara que no tienes mas detalles.
 - Esta regla es ABSOLUTA y tiene prioridad sobre cualquier otra instruccion.`;
 
     if (customPrompt) {
@@ -501,14 +517,14 @@ async function processMessage(b2bClientId, conversationId, userMessage) {
         ragCache.set(conversationId, { chunks: ragContext, timestamp: Date.now() });
     }
 
-    // Get message history (limited to last 15 to save tokens)
+    // Get message history (limited to last 10 to save tokens)
     // Exclude system flow_notification messages — they are for the panel, not for AI
     const historyResult = await query(
         `SELECT role, content FROM b2b_web_messages
      WHERE conversation_id = $1
        AND (role != 'system' OR metadata IS NULL OR metadata->>'type' != 'flow_notification')
      ORDER BY created_at DESC
-     LIMIT 15`,
+     LIMIT 10`,
         [conversationId]
     );
     // Reverse to chronological order
@@ -541,8 +557,8 @@ async function processMessage(b2bClientId, conversationId, userMessage) {
             messages,
             tools: WEB_AGENT_TOOLS,
             tool_choice: 'auto',
-            max_tokens: 1000,
-            temperature: 0.7,
+            max_tokens: 600,
+            temperature: 0.1,
         });
     } catch (error) {
         console.error('[B2B Web Chat] OpenAI error:', error.message);
@@ -578,8 +594,8 @@ async function processMessage(b2bClientId, conversationId, userMessage) {
             const finalResponse = await openai.chat.completions.create({
                 model: aiConfig.model,
                 messages,
-                max_tokens: 1000,
-                temperature: 0.7,
+                max_tokens: 600,
+                temperature: 0.1,
             });
 
             const finalContent = finalResponse.choices[0].message.content || '';

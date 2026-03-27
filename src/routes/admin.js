@@ -19,6 +19,7 @@ router.delete('/clients/:id', adminController.deleteClient);
 // Servicios de cliente
 router.post('/clients/:clientId/services', adminController.assignService);
 router.put('/clients/:clientId/services/:serviceId', adminController.updateClientService);
+router.delete('/clients/:clientId/services/:serviceId', adminController.deleteClientService);
 
 // Pagos
 router.get('/payments', adminController.getPayments);

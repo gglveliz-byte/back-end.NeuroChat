@@ -18,6 +18,18 @@ const B2B_MIGRATIONS = [
     '028_b2b_client_type.js',
     '029_create_b2b_web_tables.js',
     '030_b2b_voice_metrics.js',
+    '031_add_processing_mode_to_areas.js',
+    '032_add_coverage_details.js',
+    '033_add_audio_hash_to_interactions.js',
+    '034_create_evaluation_history.js',
+    '035_b2b_web_file_upload.js',
+    '036_add_audio_filename.js',
+    '037_add_slug_to_businesses.js',
+    '038_sync_neon_with_render.js',
+    '039_add_tags_to_conversations.js',
+    '040_create_b2b_token_usage.js',
+    '041_add_filter_hint_to_agents.js',
+    '042_add_self_hosted_config.js',
 ];
 
 async function runB2BMigrations() {

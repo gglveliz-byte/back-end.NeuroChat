@@ -379,7 +379,7 @@ async function transcribeChunk(filePath, clientAIConfig = null) {
       const text = processWhisperSegments(result);
       if (text.length > 0) {
         console.log(`[B2B Transcription] Groq success: ${text.length} chars`);
-        return postProcessTranscription(text);
+        return { text: postProcessTranscription(text), usedOpenAI: false };
       }
     } catch (groqErr) {
       console.warn('[B2B Transcription] Groq failed, trying OpenAI fallback:', groqErr.message);
@@ -406,7 +406,7 @@ async function transcribeChunk(filePath, clientAIConfig = null) {
     const text = processWhisperSegments(result);
     if (text.length > 0) {
       console.log(`[B2B Transcription] OpenAI success: ${text.length} chars`);
-      return postProcessTranscription(text);
+      return { text: postProcessTranscription(text), usedOpenAI: true };
     }
     throw new Error('OpenAI transcription returned empty text');
   }
@@ -786,7 +786,7 @@ REGLAS FINALES:
 async function diarizeTranscription(rawText, clientAIConfig, metricsText = '') {
   if (!clientAIConfig || !clientAIConfig.ai_api_key) {
     console.log('[B2B Transcription] No AI config for diarization, returning raw text');
-    return rawText;
+    return { text: rawText, _usage: null };
   }
 
   try {
@@ -797,7 +797,7 @@ async function diarizeTranscription(rawText, clientAIConfig, metricsText = '') {
     const model = clientAIConfig.ai_model || 'gpt-4o-mini';
 
     // For very long texts, split into chunks for diarization
-    const MAX_DIARIZE_CHARS = 12000;
+    const MAX_DIARIZE_CHARS = 8000; // Reducido: evita truncación con max_tokens=16000
     const textChunks = [];
     if (rawText.length <= MAX_DIARIZE_CHARS) {
       textChunks.push(rawText);
@@ -819,6 +819,7 @@ async function diarizeTranscription(rawText, clientAIConfig, metricsText = '') {
 
     const diarizedParts = [];
     let previousContext = '';
+    const diarizeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, model };
 
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
@@ -841,14 +842,21 @@ async function diarizeTranscription(rawText, clientAIConfig, metricsText = '') {
         ],
         temperature: 0,
         top_p: 1,
-        max_tokens: 8000
+        max_tokens: 16000
       });
+
+      if (response.usage) {
+        diarizeUsage.inputTokens += response.usage.prompt_tokens;
+        diarizeUsage.outputTokens += response.usage.completion_tokens;
+        diarizeUsage.totalTokens += response.usage.total_tokens;
+      }
 
       const result = response.choices[0].message.content;
       if (result && result.trim().length > 20) {
         diarizedParts.push(result.trim());
+        // Save last 6 lines for continuity — helps AI know who was speaking at the end
         const lines = result.trim().split('\n').filter(l => l.trim());
-        previousContext = lines.slice(-4).join('\n');
+        previousContext = lines.slice(-6).join('\n');
       } else {
         diarizedParts.push(chunk);
       }
@@ -858,11 +866,11 @@ async function diarizeTranscription(rawText, clientAIConfig, metricsText = '') {
 
     const fullDiarized = diarizedParts.join('\n\n');
     console.log(`[B2B Transcription] Diarization complete: ${fullDiarized.length} chars`);
-    return fullDiarized;
+    return { text: fullDiarized, _usage: diarizeUsage };
 
   } catch (diarizeErr) {
     console.error('[B2B Transcription] Diarization failed:', diarizeErr.message);
-    return rawText;
+    return { text: rawText, _usage: null };
   }
 }
 
@@ -1291,16 +1299,20 @@ async function transcribeFromFile(tmpPath, clientAIConfig = null, interactionId 
 
     tempFiles.push(...speechChunks.filter(c => !c.isOriginal).map(c => c.path));
 
+    let audioUsedOpenAI = false;
     if (speechChunks.length === 1 && speechChunks[0].isOriginal) {
       console.log('[B2B Transcription] Transcribing single file (no silence splitting needed)...');
-      rawText = await transcribeChunk(mp3Path, clientAIConfig);
+      const chunkResult = await transcribeChunk(mp3Path, clientAIConfig);
+      rawText = chunkResult.text;
+      if (chunkResult.usedOpenAI) audioUsedOpenAI = true;
     } else {
       const parts = [];
       for (let i = 0; i < speechChunks.length; i++) {
         const chunk = speechChunks[i];
         console.log(`[B2B Transcription] Transcribing speech segment ${i + 1}/${speechChunks.length} (${chunk.duration}s from ${Math.round(chunk.start)}s)...`);
-        const text = await transcribeChunk(chunk.path, clientAIConfig);
-        if (text && text.trim().length > 0) parts.push(text.trim());
+        const chunkResult = await transcribeChunk(chunk.path, clientAIConfig);
+        if (chunkResult.usedOpenAI) audioUsedOpenAI = true;
+        if (chunkResult.text && chunkResult.text.trim().length > 0) parts.push(chunkResult.text.trim());
         if (chunk.silenceAfter && chunk.silenceAfter >= MIN_SILENCE_GAP && i < speechChunks.length - 1) {
           parts.push(`[Silencio detectado: ${Math.round(chunk.silenceAfter)}s]`);
         }
@@ -1309,7 +1321,7 @@ async function transcribeFromFile(tmpPath, clientAIConfig = null, interactionId 
       rawText = parts.join(' ');
     }
 
-    console.log(`[B2B Transcription] Whisper fallback complete: ${rawText.length} chars`);
+    console.log(`[B2B Transcription] Whisper fallback complete: ${rawText.length} chars (provider: ${audioUsedOpenAI ? 'openai-whisper-1' : 'groq'})`);
 
     const voiceMetrics = await analyzeVoiceMetrics(mp3Path, duration);
     const wordCount = rawText.split(/\s+/).filter(w => w.length > 0).length;
@@ -1324,7 +1336,7 @@ async function transcribeFromFile(tmpPath, clientAIConfig = null, interactionId 
     const metricsText = formatVoiceMetrics(voiceMetrics);
 
     console.log(`[B2B Transcription] Fallback pipeline complete: ${rawText.length} chars, ${wordCount} words, quality: ${txQuality.level} (${txQuality.score}/100)`);
-    return { rawText, metricsText, voiceMetrics, whisperxUsed: false };
+    return { rawText, metricsText, voiceMetrics, whisperxUsed: false, audioUsedOpenAI, audioDurationSecs: duration };
 
   } finally {
     for (const f of tempFiles) {
@@ -1465,14 +1477,16 @@ Asesor: Empleado del call center. Se identifica por:
 - DA soluciones: "lo que vamos a hacer es...", "le voy a generar un ticket"
 - USA lenguaje corporativo: "disculpe los malestares"
 - PONE en espera: "permítame un momento", "me regala unos minutos"
-CLAVE: Tono profesional, acceso al sistema, guía la conversación
+- OFRECE ayuda extra o CIERRA: "¿Alguna duda adicional?", "¿Algo más en que le pueda ayudar?", "Gracias por comunicarse"
+CLAVE: Tono profesional, acceso al sistema, guía la conversación, ofrece ayuda al final.
 
 Cliente: Persona que llama para resolver algo. Se identifica por:
 - EXPLICA su problema: "no tengo internet", "me llegó una factura muy alta"
 - DA sus datos personales cuando se los piden
-- HACE preguntas: "¿cuándo se me va a solucionar?", "¿por qué me cobraron?"
+- HACE preguntas reales sobre su problema: "¿cuándo se me va a solucionar?"
 - MUESTRA emociones: frustración, urgencia, enojo
-CLAVE: Tiene el problema, da datos, hace preguntas, no tiene acceso al sistema
+- DECLINA ayuda y despide: "Eso sería todo de mi parte", "Ninguna duda", "Gracias"
+CLAVE: Tiene el problema, da datos, no tiene acceso al sistema, rechaza más ayuda al final.
 
 ═══ ESTRUCTURA TÍPICA (3+ SPEAKERS) ═══
 1. SPEAKER_00 suele ser [Sistema]/Bot — habla primero con mensaje automatizado
@@ -1482,8 +1496,8 @@ PERO: SIEMPRE verifica por CONTENIDO, no solo por orden
 
 ═══ REGLAS DE ORO ═══
 1. DEDUCCIÓN POR CONTENIDO (prioridad máxima):
-   - Quien PIDE cédula/datos = Asesor
-   - Quien DA sus datos personales = Cliente
+   - Quien PIDE cédula/datos o PREGUNTA "¿Alguna duda adicional?" = Asesor
+   - Quien DA datos o RESPONDE "Eso sería todo" = Cliente
    - Voz robótica/estandarizada = [Sistema]
 2. NO AGRUPAR [Sistema] con Asesor — son roles DISTINTOS. El bot/IVR NO es el asesor.
 3. Si hay SPEAKER_03 o más, deduce por contenido: ¿es otro asesor (transferencia)?, ¿supervisor?, ¿ruido?
@@ -1503,7 +1517,91 @@ REGLAS FINALES:
 - OMITE texto incoherente o basura de transcripción
 - Mantén el texto COMPLETO de cada turno — no resumas`;
 
-async function remapWhisperXSpeakers(whisperxText, clientAIConfig) {
+const REMAP_SPEAKERS_MULTI_AGENT_PROMPT = `Eres un EXPERTO en transcripción y diarización de llamadas de call center (Ecuador/Latinoamérica).
+
+TU MISIÓN: Recibir una transcripción de WhisperX con etiquetas SPEAKER_00, SPEAKER_01, etc., y transformarla identificando MÚLTIPLES ASESORES (cuando hay transferencias o participan varios agentes).
+
+═══ LOS ROLES ═══
+
+[Sistema]: Voz pregrabada, bot, IVR automatizado.
+- IVR/menus, grabaciones legales, bot de bienvenida, encuestas, música de espera
+CLAVE: Voz robótica/uniforme, frases estandarizadas
+
+Asesor 1: PRIMER asesor humano que atiende la llamada. Se identifica por:
+- Es la primera voz HUMANA profesional después del IVR/bot
+- Presenta su nombre y empresa
+- Pide datos, consulta sistema, da soluciones iniciales
+- OFRECE ayuda extra o CIERRA: "¿Alguna duda adicional?", "¿Algo más en que le pueda ayudar?"
+
+Asesor 2: SEGUNDO asesor (si hay transferencia). Se identifica por:
+- Aparece DESPUÉS de una espera/transferencia
+- Se presenta nuevamente o dice "me transfirieron su caso"
+- Diferente voz/nombre que Asesor 1
+- OFRECE ayuda extra o CIERRA corporativamente.
+- Si hay un tercer asesor, usa "Asesor 3", etc.
+
+Cliente: Persona que llama para resolver algo.
+- Explica su problema, da datos personales, hace preguntas
+- DECLINA ayuda y despide: "Eso sería todo de mi parte", "Ninguna otra duda", "Gracias"
+CLAVE: Tiene el problema, da datos, no tiene acceso al sistema, rechaza ayuda extra al final.
+
+═══ DETECCIÓN DE TRANSFERENCIAS ═══
+1. Espera larga (>30s) seguida de nueva voz profesional = probable transferencia
+2. Frases clave: "le voy a transferir", "le paso con", "un momento mientras le comunico"
+3. Nuevo asesor se presenta: "buenos días, me indica que...", "le saluda [otro nombre]"
+4. Si NO hay evidencia de transferencia, usa solo "Asesor" (sin número)
+
+═══ FORMATO DE SALIDA ═══
+[Sistema]: texto del IVR/bot
+Asesor 1: texto del primer asesor
+Cliente: texto del cliente
+[Espera: ~Xs]
+Asesor 2: texto del segundo asesor (si aplica)
+
+═══ REGLAS ═══
+- Si solo hay UN asesor humano, usa "Asesor 1:" (no "Asesor:")
+- SIEMPRE numera los asesores: Asesor 1, Asesor 2, Asesor 3...
+- Responde ÚNICAMENTE con la transcripción reformateada
+- NO agregues introducciones ni explicaciones
+- Mantén el texto COMPLETO de cada turno`;
+
+/**
+ * Build explicit SPEAKER_XX → role map by comparing the original WhisperX chunk
+ * with the remapped output (positional matching by order of first appearance).
+ * WhisperX SPEAKER_XX labels are consistent across the entire file, so this map
+ * built from chunk 0 is valid for all subsequent chunks.
+ */
+function _buildSpeakerXXMapFromChunk(originalChunk, remappedOutput) {
+  // Collect unique SPEAKER_XX in order of first appearance in original
+  const speakers = [];
+  for (const line of originalChunk.split('\n')) {
+    const m = line.trim().match(/^(SPEAKER_\d+):/i);
+    if (m) {
+      const spk = m[1].toUpperCase();
+      if (!speakers.includes(spk)) speakers.push(spk);
+    }
+  }
+  if (speakers.length === 0) return {};
+
+  // Collect unique roles in order of first appearance in remapped output
+  const roles = [];
+  for (const line of remappedOutput.split('\n')) {
+    const m = line.trim().match(/^(\[Sistema\]|Asesor \d+|Asesor|Cliente):/i);
+    if (m) {
+      const role = m[1];
+      if (!roles.includes(role)) roles.push(role);
+    }
+  }
+
+  // Map positionally (first SPEAKER_XX seen → first role seen, etc.)
+  const map = {};
+  for (let i = 0; i < Math.min(speakers.length, roles.length); i++) {
+    map[speakers[i]] = roles[i];
+  }
+  return map;
+}
+
+async function remapWhisperXSpeakers(whisperxText, clientAIConfig, options = {}) {
   if (!clientAIConfig || !clientAIConfig.ai_api_key) {
     console.log('[B2B Transcription] No AI config for speaker remapping, returning WhisperX text as-is');
     return whisperxText;
@@ -1516,8 +1614,7 @@ async function remapWhisperXSpeakers(whisperxText, clientAIConfig) {
     const openai = new OpenAI({ apiKey });
     const model = clientAIConfig.ai_model || 'gpt-4o-mini';
 
-    // For long texts, chunk it
-    const MAX_REMAP_CHARS = 14000;
+    const MAX_REMAP_CHARS = 50000;
     const textChunks = [];
     if (whisperxText.length <= MAX_REMAP_CHARS) {
       textChunks.push(whisperxText);
@@ -1534,43 +1631,94 @@ async function remapWhisperXSpeakers(whisperxText, clientAIConfig) {
       if (current) textChunks.push(current);
     }
 
-    console.log(`[B2B Transcription] Remapping WhisperX speakers (${whisperxText.length} chars, ${textChunks.length} chunk(s))...`);
+    console.log(`[B2B Transcription] Remapping WhisperX speakers with chunks of ${MAX_REMAP_CHARS} (${whisperxText.length} chars, ${textChunks.length} chunk(s))...`);
 
     const remappedParts = [];
-    let speakerMap = ''; // Carry speaker mapping between chunks
+    let speakerXXMap = {};
+    let lastLines = '';
+    const remapUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, model };
 
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
       let userMessage = '';
-      if (i > 0 && speakerMap) {
-        userMessage += `[Mapeo de speakers ya establecido: ${speakerMap}]\n\n`;
+
+      if (i > 0) {
+        if (Object.keys(speakerXXMap).length > 0) {
+          const mapStr = Object.entries(speakerXXMap).map(([k, v]) => `${k}=${v}`).join(', ');
+          userMessage += `[MAPEO CONFIRMADO DE HABLANTES — usa esto exactamente, no cambies los roles]: ${mapStr}\n\n`;
+        }
+        if (lastLines) {
+          userMessage += `[CONTEXTO — últimas líneas del segmento anterior, NO repetir en la respuesta]:\n${lastLines}\n\n---\n\n`;
+        }
       }
-      userMessage += `${i === 0 ? 'Clasifica los hablantes en esta transcripción' : 'Continúa con la siguiente parte (mismo mapeo de speakers)'}:\n\n${chunk}`;
+      if (i === 0) {
+        userMessage += `Clasifica los hablantes en esta transcripción:\n\n${chunk}`;
+      } else {
+        userMessage += `CONTINÚA la transcripción desde donde quedó. El contexto anterior muestra el último hablante activo. Empieza directamente desde el SIGUIENTE turno — NO repitas el contexto previo, NO reinicies la conversación:\n\n${chunk}`;
+      }
 
-      const response = await openai.chat.completions.create({
-        model,
-        messages: [
-          { role: 'system', content: REMAP_SPEAKERS_PROMPT },
-          { role: 'user', content: userMessage }
-        ],
-        temperature: 0,
-        top_p: 1,
-        max_tokens: 8000
-      });
+      const systemPrompt = options.multiAgentEnabled ? REMAP_SPEAKERS_MULTI_AGENT_PROMPT : REMAP_SPEAKERS_PROMPT;
+      let messages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ];
 
-      const result = response.choices[0].message.content;
-      if (result && result.trim().length > 20) {
+      let isComplete = false;
+      let cumulativeResult = "";
+      let continuationCount = 0;
+
+      // Loop de Greedy Continuation: Si Qwen se corta por token limits, le pedimos que siga
+      while (!isComplete && continuationCount < 10) {
+        const response = await openai.chat.completions.create({
+          model,
+          messages,
+          temperature: 0,
+          top_p: 1,
+          max_tokens: 16000
+        });
+
+        if (response.usage) {
+          remapUsage.inputTokens += response.usage.prompt_tokens;
+          remapUsage.outputTokens += response.usage.completion_tokens;
+          remapUsage.totalTokens += response.usage.total_tokens;
+        }
+
+        const partialText = response.choices[0].message.content;
+        cumulativeResult += partialText;
+        const finishReason = response.choices[0].finish_reason;
+        
+        if (finishReason === 'length') {
+          continuationCount++;
+          console.warn(`[B2B Transcription] ⚠️ LLM limit reached at ${cumulativeResult.length} chars. Auto-continuing (Continuation ${continuationCount})...`);
+          
+          // Agregamos lo que el LLM generó a su memoria para que no lo pierda
+          messages.push({ role: 'assistant', content: partialText });
+          // Ordenamos continuación limpia
+          messages.push({ role: 'user', content: 'CONTINÚA exactamente desde la última letra donde te cortaste. Retoma la frase incompleta y sigue transcribiendo. NO repitas texto, NO saludes, NO des introducciones.' });
+        } else {
+          isComplete = true; // finish_reason === 'stop' o completado naturalmente
+        }
+      }
+
+      if (continuationCount >= 10) {
+        console.warn(`[B2B Transcription] 🚨 Maximum continuations (10) reached for chunk ${i + 1}. Ejecting partial result.`);
+      }
+
+      const result = cumulativeResult;
+      const hasRecognizableRoles = result && /^(Asesor|Cliente|\[Sistema\])/m.test(result.trim());
+      
+      if (result && result.trim().length > 20 && hasRecognizableRoles) {
         remappedParts.push(result.trim());
 
-        // Extract speaker mapping from first chunk for continuity
         if (i === 0) {
-          const mappings = [];
-          if (result.includes('Asesor:')) mappings.push('Asesor identificado');
-          if (result.includes('Cliente:')) mappings.push('Cliente identificado');
-          if (result.includes('[Sistema]:')) mappings.push('Sistema identificado');
-          speakerMap = mappings.join(', ');
+          speakerXXMap = _buildSpeakerXXMapFromChunk(chunk, result);
+          console.log(`[B2B Transcription] Speaker XX map built: ${JSON.stringify(speakerXXMap)}`);
         }
+
+        const lines = result.trim().split('\n').filter(l => l.trim());
+        lastLines = lines.slice(-10).join('\n');
       } else {
+        console.warn(`[B2B Transcription] Remap chunk ${i + 1}: respuesta muy corta o sin roles, usando texto original`);
         remappedParts.push(chunk);
       }
 
@@ -1579,11 +1727,11 @@ async function remapWhisperXSpeakers(whisperxText, clientAIConfig) {
 
     const fullRemapped = remappedParts.join('\n\n');
     console.log(`[B2B Transcription] Speaker remapping complete: ${fullRemapped.length} chars`);
-    return fullRemapped;
+    return { text: fullRemapped, _usage: remapUsage };
 
   } catch (remapErr) {
     console.error('[B2B Transcription] Speaker remapping failed:', remapErr.message);
-    return whisperxText; // Fallback: return original WhisperX text
+    return { text: whisperxText, _usage: null }; // Fallback: return original WhisperX text
   }
 }
 

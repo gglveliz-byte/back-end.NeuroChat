@@ -393,7 +393,7 @@ async function generateAndSendBotResponse({
   const historyResult = await query(`
     SELECT sender_type, content FROM messages
     WHERE conversation_id = $1
-    ORDER BY created_at DESC LIMIT 30
+    ORDER BY created_at DESC LIMIT 10
   `, [conversationId]);
   const messageHistory = historyResult.rows.reverse();
 
@@ -401,12 +401,54 @@ async function generateAndSendBotResponse({
   const userMessagesInHistory = messageHistory.filter(m => m.sender_type === 'contact');
   const isNewConversation = userMessagesInHistory.length === 0;
 
+  // ── Customer Context: obtener datos para personalizar la respuesta ──
+  const [convMetaRes, orderSummaryRes, lastOrderRes, productSummaryRes, msgCountRes] = await Promise.all([
+    query('SELECT contact_name, contact_phone, contact_email, created_at, last_message_at FROM conversations WHERE id = $1', [conversationId])
+      .catch(() => ({ rows: [] })),
+    query(`SELECT COUNT(*)::int as total_orders, COALESCE(SUM(total_amount), 0)::float as total_spent
+           FROM orders WHERE conversation_id = $1 AND status NOT IN ('lead', 'cancelled')`, [conversationId])
+      .catch(() => ({ rows: [{ total_orders: 0, total_spent: 0 }] })),
+    query(`SELECT items, total_amount, status, created_at FROM orders
+           WHERE conversation_id = $1 AND status NOT IN ('lead', 'cancelled')
+           ORDER BY created_at DESC LIMIT 1`, [conversationId])
+      .catch(() => ({ rows: [] })),
+    query(`SELECT category, COUNT(*)::int as count FROM products
+           WHERE client_id = $1 AND is_active = true AND category IS NOT NULL AND category != ''
+           GROUP BY category ORDER BY count DESC LIMIT 8`, [serviceData.client_id])
+      .catch(() => ({ rows: [] })),
+    query('SELECT COUNT(*)::int as message_count FROM messages WHERE conversation_id = $1', [conversationId])
+      .catch(() => ({ rows: [{ message_count: 0 }] })),
+  ]);
+
+  const convMeta = convMetaRes.rows[0] || {};
+  const orderSummary = orderSummaryRes.rows[0] || { total_orders: 0, total_spent: 0 };
+  const lastOrder = lastOrderRes.rows[0] || null;
+  const productCategories = productSummaryRes.rows || [];
+  const messageCount = msgCountRes.rows[0]?.message_count || 0;
+
+  const welcomeAlreadySent = messageHistory.some(m => m.sender_type === 'bot');
+
+  const customerContext = {
+    contactName: (convMeta.contact_name && convMeta.contact_name !== 'Sin nombre') ? convMeta.contact_name : null,
+    isReturning: !isNewConversation && messageHistory.length > 2,
+    daysSinceLastMessage: convMeta.last_message_at
+      ? Math.floor((Date.now() - new Date(convMeta.last_message_at)) / 86400000) : 0,
+    totalOrders: orderSummary.total_orders,
+    totalSpent: orderSummary.total_spent,
+    lastOrderItems: lastOrder?.items || null,
+    lastOrderDate: lastOrder?.created_at || null,
+    messageCount,
+    productCategories,
+    welcomeAlreadySent,
+  };
+
   // Info del negocio
   const businessInfo = {
     name: serviceData.business_name,
     industry: serviceData.industry,
     description: serviceData.description,
     website: serviceData.website,
+    slug: serviceData.slug,
     address: serviceData.address,
     phone: serviceData.business_phone,
     email: serviceData.business_email
@@ -470,6 +512,19 @@ async function generateAndSendBotResponse({
     paymentConfig = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
   } catch { /* usar defaults */ }
 
+  // Enviar typing ANTES de llamar a la IA — el usuario ve que el bot está "pensando"
+  // Se dispara sin await para no bloquear el flujo
+  try {
+    const creds = serviceData.config?.platform_credentials || serviceData.config?.api_credentials || {};
+    if (platform === 'messenger') {
+      const token = creds.page_access_token;
+      if (token) metaService.sendMessengerTypingIndicator(token, contactId, 'typing_on').catch(() => {});
+    } else if (platform === 'instagram') {
+      const token = creds.instagram_access_token || creds.page_access_token;
+      if (token) metaService.sendMessengerTypingIndicator(token, contactId, 'typing_on').catch(() => {});
+    }
+  } catch { /* ignorar — no bloquea */ }
+
   const { content: responseText, usage, productImages = [] } = await generateResponse({
     userMessage: messageContent,
     messageHistory,
@@ -480,7 +535,7 @@ async function generateAndSendBotResponse({
       fallbackMessage: botConfig.fallback_message,
       model: aiConfig.model || 'gpt-4o-mini',
       temperature: aiConfig.temperature || 0.7,
-      maxTokens: aiConfig.max_tokens || 350,
+      maxTokens: aiConfig.max_tokens || 500,
       knowledgeFiles,
       paymentConfig
     },
@@ -489,7 +544,9 @@ async function generateAndSendBotResponse({
     conversationId,
     planType,
     imageUrl,
-    isNewConversation
+    isNewConversation,
+    platform,
+    customerContext,
   });
 
   // Guardar respuesta del bot (guardar texto limpio sin marcadores [SPLIT])
@@ -602,13 +659,25 @@ async function generateAndSendBotResponse({
   }
 
   // Enviar a la plataforma
-  // Si el usuario mandó audio (wasAudio) en WhatsApp → responder con nota de voz (ahora limitado al 30% de las veces por costos operativos)
-  // El texto se guarda en DB para el panel del admin
+  // Criterios para responder con nota de voz:
+  //   a) el usuario mandó audio (audio-to-audio) — 30% de probabilidad para ahorrar costos
+  //   b) el usuario PIDIÓ EXPLÍCITAMENTE un audio ("no puedo leer", "manda un audio", etc.)
+  // En ambos casos solo funciona en WhatsApp (única plataforma con sendWhatsAppAudio implementado)
   let sendResult;
 
-  const shouldMirrorAudio = wasAudio && platform === 'whatsapp' && Math.random() < 0.30;
+  const AUDIO_REQUEST_KEYWORDS = [
+    'no puedo leer', 'no puedo ver', 'manda un audio', 'mándame un audio',
+    'envíame un audio', 'manda audio', 'audio por favor', 'en audio',
+    'respóndeme en audio', 'respondeme en audio', 'mensaje de voz',
+    'nota de voz', 'voice note', 'send audio', 'send voice',
+  ];
+  const userRequestedAudio = platform === 'whatsapp' &&
+    AUDIO_REQUEST_KEYWORDS.some(kw => messageContent.toLowerCase().includes(kw));
 
-  if (shouldMirrorAudio) {
+  const shouldMirrorAudio = wasAudio && platform === 'whatsapp' && Math.random() < 0.30;
+  const shouldSendAudio = userRequestedAudio || shouldMirrorAudio;
+
+  if (shouldSendAudio) {
     sendResult = await sendBotVoiceNoteToPlatform(serviceData, contactPhone, cleanResponseText, messageId);
     if (!sendResult.success) {
       // Fallback: si TTS falla, enviar texto normal
@@ -1644,6 +1713,49 @@ const sendWebChatMessage = async (req, res) => {
 
         const messageHistory = historyResult.rows.reverse();
 
+        // ── Customer Context para WebChat ──
+        const wcUserMessages = messageHistory.filter(m => m.sender_type === 'contact');
+        const wcIsNewConversation = wcUserMessages.length === 0;
+
+        const [wcConvMetaRes, wcOrderSummaryRes, wcLastOrderRes, wcProductSummaryRes, wcMsgCountRes] = await Promise.all([
+          query('SELECT contact_name, contact_phone, contact_email, created_at, last_message_at FROM conversations WHERE id = $1', [conversationId])
+            .catch(() => ({ rows: [] })),
+          query(`SELECT COUNT(*)::int as total_orders, COALESCE(SUM(total_amount), 0)::float as total_spent
+                 FROM orders WHERE conversation_id = $1 AND status NOT IN ('lead', 'cancelled')`, [conversationId])
+            .catch(() => ({ rows: [{ total_orders: 0, total_spent: 0 }] })),
+          query(`SELECT items, total_amount, status, created_at FROM orders
+                 WHERE conversation_id = $1 AND status NOT IN ('lead', 'cancelled')
+                 ORDER BY created_at DESC LIMIT 1`, [conversationId])
+            .catch(() => ({ rows: [] })),
+          query(`SELECT category, COUNT(*)::int as count FROM products
+                 WHERE client_id = $1 AND is_active = true AND category IS NOT NULL AND category != ''
+                 GROUP BY category ORDER BY count DESC LIMIT 8`, [conversation.client_id])
+            .catch(() => ({ rows: [] })),
+          query('SELECT COUNT(*)::int as message_count FROM messages WHERE conversation_id = $1', [conversationId])
+            .catch(() => ({ rows: [{ message_count: 0 }] })),
+        ]);
+
+        const wcConvMeta = wcConvMetaRes.rows[0] || {};
+        const wcOrderSummary = wcOrderSummaryRes.rows[0] || { total_orders: 0, total_spent: 0 };
+        const wcLastOrder = wcLastOrderRes.rows[0] || null;
+        const wcProductCategories = wcProductSummaryRes.rows || [];
+        const wcMessageCount = wcMsgCountRes.rows[0]?.message_count || 0;
+        const wcWelcomeAlreadySent = messageHistory.some(m => m.sender_type === 'bot');
+
+        const wcCustomerContext = {
+          contactName: wcConvMeta.contact_name || null,
+          isReturning: !wcIsNewConversation && messageHistory.length > 2,
+          daysSinceLastMessage: wcConvMeta.last_message_at
+            ? Math.floor((Date.now() - new Date(wcConvMeta.last_message_at)) / 86400000) : 0,
+          totalOrders: wcOrderSummary.total_orders,
+          totalSpent: wcOrderSummary.total_spent,
+          lastOrderItems: wcLastOrder?.items || null,
+          lastOrderDate: wcLastOrder?.created_at || null,
+          messageCount: wcMessageCount,
+          productCategories: wcProductCategories,
+          welcomeAlreadySent: wcWelcomeAlreadySent,
+        };
+
         // Parsear AI config
         let aiConfig = {};
         try {
@@ -1693,7 +1805,7 @@ const sendWebChatMessage = async (req, res) => {
             fallbackMessage: conversation.fallback_message,
             model: aiConfig.model || 'gpt-4o-mini',
             temperature: aiConfig.temperature || 0.7,
-            maxTokens: aiConfig.max_tokens || 350,
+            maxTokens: aiConfig.max_tokens || 500,
             knowledgeFiles,
             paymentConfig: wcPaymentConfig
           },
@@ -1709,6 +1821,8 @@ const sendWebChatMessage = async (req, res) => {
           conversationId,
           planType: webchatPlanType,
           platform: 'webchat',
+          isNewConversation: wcIsNewConversation,
+          customerContext: wcCustomerContext,
         });
 
         // Detectar handoff: si la IA incluyó [HANDOFF], activar transferencia a humano

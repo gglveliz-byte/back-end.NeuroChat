@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+// ─── Self-Hosted AI Bootstrap (must load before any OpenAI imports) ───
+require('./services/selfHostedBootstrap');
+
 // ─── Global error handlers (prevent crashes from Redis/ioredis uncaught errors) ───
 process.on('uncaughtException', (err) => {
   const msg = err.message || '';
@@ -216,6 +219,8 @@ app.use('/api/v1/store', require('./routes/store'));
 app.use('/api/v1/voice', voiceRoutes);
 app.use('/api/v1/b2b', b2bRoutes);
 app.use('/api/v1/b2b-web', b2bWebRoutes);
+const { authenticate: authMw, adminOnly: adminMw } = require('./middlewares/auth');
+app.use('/api/v1/admin/ai-provider', authMw, adminMw, require('./routes/selfHostedAdmin'));
 
 // Ruta para servicios disponibles (pública)
 app.get('/api/v1/services', publicServiceController.getServices);

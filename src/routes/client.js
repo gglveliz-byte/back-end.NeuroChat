@@ -6,20 +6,9 @@ const clientController = require('../controllers/clientController');
 const { authenticate, clientOnly, emailVerified } = require('../middlewares/auth');
 const { validateUpdateProfile, validateUpdateBusiness, validateChangePassword } = require('../middlewares/validation');
 
-// Multer diskStorage para imágenes del negocio (logo y banner)
-const fs = require('fs');
-const uploadsDir = path.join(__dirname, '../../uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-
-const imageStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
-  }
-});
+// Multer memoryStorage para imágenes del negocio (logo y banner) → se suben a Cloudinary
 const imageUpload = multer({
-  storage: imageStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (/jpeg|jpg|png|webp/.test(file.mimetype)) cb(null, true);

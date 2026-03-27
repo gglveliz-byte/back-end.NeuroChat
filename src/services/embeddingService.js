@@ -11,13 +11,14 @@
 
 const OpenAI = require('openai');
 const { query } = require('../config/database');
+const selfHostedAI = require('./selfHostedAIService');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dims — cheapest, excellent quality
 const CHUNK_SIZE = 400;  // words per chunk (~600-800 tokens)
 const CHUNK_OVERLAP = 50; // words of overlap between adjacent chunks
-const MIN_SIMILARITY = 0.30; // discard chunks below this cosine similarity
+const MIN_SIMILARITY = 0.45; // discard chunks below this cosine similarity — higher = less noise, faster inference
 const BATCH_SIZE = 10; // embeddings per API call batch
 
 // Cache: is pgvector available on this DB?
@@ -30,7 +31,7 @@ let _pgvectorAvailable = null;
 const isPgvectorAvailable = async () => {
   if (_pgvectorAvailable !== null) return _pgvectorAvailable;
   try {
-    await query("SELECT 'test'::vector(1)");
+    await query("SELECT '[1.0]'::vector(1)");
     _pgvectorAvailable = true;
   } catch {
     console.warn('[RAG] pgvector extension NOT available — RAG indexing/search disabled. Install pgvector on your PostgreSQL to enable.');
@@ -82,14 +83,31 @@ const chunkText = (text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) => {
 // =====================================================
 
 /**
- * Generates a vector embedding for a given text using OpenAI.
+ * Generates a vector embedding for a given text.
+ * Tries self-hosted first (gte-Qwen2-1.5B), falls back to OpenAI text-embedding-3-small.
  * @param {string} text — input text (truncated to 8000 chars to stay within limits)
  * @returns {number[]}  — 1536-dimension float array
  */
 const generateEmbedding = async (text) => {
+  const input = text.slice(0, 8000);
+
+  // ── Try self-hosted embedding server first ──
+  if (process.env.SELF_HOSTED_EMBEDDING_URL) {
+    try {
+      const res = await selfHostedAI.generateEmbedding(input);
+      const embedding = res?.data?.[0]?.embedding;
+      if (Array.isArray(embedding) && embedding.length > 0) {
+        return embedding;
+      }
+    } catch (err) {
+      console.warn('[RAG] Self-hosted embedding failed, falling back to OpenAI:', err.message);
+    }
+  }
+
+  // ── Fallback: OpenAI ──
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
-    input: text.slice(0, 8000), // ~6000 tokens max
+    input,
   });
   return response.data[0].embedding;
 };
@@ -112,8 +130,8 @@ const generateEmbedding = async (text) => {
  * @param {string} filename  — human-readable filename (for logging)
  */
 const indexKnowledgeFile = async (fileId, clientId, text, filename) => {
-  if (!process.env.OPENAI_API_KEY) {
-    console.warn('[RAG] Skipping indexing: OPENAI_API_KEY not configured');
+  if (!process.env.OPENAI_API_KEY && !process.env.SELF_HOSTED_EMBEDDING_URL) {
+    console.warn('[RAG] Skipping indexing: no embedding provider configured (need OPENAI_API_KEY or SELF_HOSTED_EMBEDDING_URL)');
     return;
   }
 
@@ -176,7 +194,7 @@ const indexKnowledgeFile = async (fileId, clientId, text, filename) => {
  * @returns {Array<{content: string, filename: string, similarity: number}>}
  */
 const searchRelevantChunks = async (userQuery, clientId, limit = 5) => {
-  if (!process.env.OPENAI_API_KEY || !userQuery || !clientId) return [];
+  if ((!process.env.OPENAI_API_KEY && !process.env.SELF_HOSTED_EMBEDDING_URL) || !userQuery || !clientId) return [];
   if (!(await isPgvectorAvailable())) return [];
 
   try {

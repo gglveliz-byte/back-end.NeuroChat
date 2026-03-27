@@ -407,7 +407,63 @@ const markAttended = async (req, res) => {
   }
 };
 
-// ==================== ACCIONES DE CONVERSACIÓN (Archivar / Vaciar) ====================
+// ==================== ACCIONES DE CONVERSACIÓN (Archivar / Vaciar / Eliminar / Etiquetas) ====================
+
+const deleteConversation = async (req, res) => {
+  try {
+    const { code, conversationId } = req.params;
+
+    const accessCheck = await query(`
+      SELECT c.id FROM conversations c
+      JOIN client_services cs ON c.client_service_id = cs.id
+      JOIN services s ON cs.service_id = s.id
+      WHERE c.id = $1 AND cs.client_id = $2 AND s.code = $3
+    `, [conversationId, req.user.id, code]);
+
+    if (accessCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Conversación no encontrada' });
+    }
+
+    await query("DELETE FROM conversations WHERE id = $1", [conversationId]);
+
+    res.json({ success: true, message: 'Conversación eliminada permanentemente' });
+  } catch (error) {
+    console.error('Error en deleteConversation:', error);
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+};
+
+const updateConversationTags = async (req, res) => {
+  try {
+    const { code, conversationId } = req.params;
+    const { tags } = req.body;
+
+    if (!Array.isArray(tags)) {
+      return res.status(400).json({ success: false, error: 'Las etiquetas deben ser un array' });
+    }
+
+    const accessCheck = await query(`
+      SELECT c.id FROM conversations c
+      JOIN client_services cs ON c.client_service_id = cs.id
+      JOIN services s ON cs.service_id = s.id
+      WHERE c.id = $1 AND cs.client_id = $2 AND s.code = $3
+    `, [conversationId, req.user.id, code]);
+
+    if (accessCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Conversación no encontrada' });
+    }
+
+    await query(
+      "UPDATE conversations SET tags = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+      [JSON.stringify(tags), conversationId]
+    );
+
+    res.json({ success: true, message: 'Etiquetas actualizadas', data: { tags } });
+  } catch (error) {
+    console.error('Error en updateConversationTags:', error);
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+};
 
 const archiveConversation = async (req, res) => {
   try {
@@ -1271,7 +1327,9 @@ module.exports = {
   getVoiceConfig,
   updateVoiceConfig,
   archiveConversation,
+  deleteConversation,
   clearMessages,
+  updateConversationTags,
   getMessagingProvider,
   getBirdChannel,
   saveBirdChannel,

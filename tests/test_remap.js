@@ -2,7 +2,7 @@ const fs = require('fs');
 const { OpenAI } = require('openai');
 require('dotenv').config();
 
-const d = require('./whisper_result.json');
+const d = require('../whisper_result.json');
 const rawText = d.segments.map(s => s.speaker + ': ' + s.text).join('\n');
 
 const REMAP_SPEAKERS_PROMPT = `Eres un clasificador de hablantes en llamadas de call center (Ecuador/Latinoamérica).

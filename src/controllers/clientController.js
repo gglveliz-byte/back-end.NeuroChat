@@ -7,6 +7,7 @@ const pdfParse = require('pdf-parse');
 const XLSX = require('xlsx');
 const { indexKnowledgeFile } = require('../services/embeddingService');
 const { getMonthlyUsage, getDailyUsage, checkBalance } = require('../services/billingService');
+const { uploadFromBuffer } = require('../services/cloudinaryService');
 
 // ==================== PERFIL ====================
 
@@ -208,32 +209,32 @@ const updateBusiness = async (req, res) => {
   }
 };
 
-// ── Upload logo del negocio ──────────────────────────────
+// ── Upload logo del negocio → Cloudinary (persistente) ──
 const uploadBusinessLogo = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No se recibió imagen' });
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const uploaded = await uploadFromBuffer(req.file.buffer, 'business/logos');
     await query(
       'UPDATE businesses SET logo_url = $1, updated_at = CURRENT_TIMESTAMP WHERE client_id = $2',
-      [fileUrl, req.user.id]
+      [uploaded.url, req.user.id]
     );
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: uploaded.url });
   } catch (error) {
     console.error('Error en uploadBusinessLogo:', error);
     res.status(500).json({ success: false, error: 'Error interno del servidor' });
   }
 };
 
-// ── Upload banner del negocio ────────────────────────────
+// ── Upload banner del negocio → Cloudinary (persistente) ──
 const uploadBusinessBanner = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No se recibió imagen' });
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const uploaded = await uploadFromBuffer(req.file.buffer, 'business/banners');
     await query(
       'UPDATE businesses SET banner_url = $1, updated_at = CURRENT_TIMESTAMP WHERE client_id = $2',
-      [fileUrl, req.user.id]
+      [uploaded.url, req.user.id]
     );
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: uploaded.url });
   } catch (error) {
     console.error('Error en uploadBusinessBanner:', error);
     res.status(500).json({ success: false, error: 'Error interno del servidor' });

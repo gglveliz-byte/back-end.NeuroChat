@@ -181,6 +181,8 @@ const handleCallback = async (req, res) => {
           );
         }
         // Usar la página que tiene Instagram vinculado
+        // Solo guardar páginas con IG vinculado en available_pages
+        const pagesWithIG = pages.filter(p => p.instagramAccount);
         credentials = {
           user_access_token: longLived.accessToken,
           page_access_token: pageWithIG.pageAccessToken,
@@ -188,7 +190,7 @@ const handleCallback = async (req, res) => {
           page_name: pageWithIG.pageName,
           instagram_account_id: pageWithIG.instagramAccount.id,
           instagram_username: pageWithIG.instagramAccount.username,
-          available_pages: pages
+          available_pages: pagesWithIG
         };
       } else {
         credentials = {
@@ -440,7 +442,10 @@ const selectAccount = async (req, res) => {
       creds.page_id = selectedPage.pageId;
       creds.page_name = selectedPage.pageName;
 
-      if (serviceCode === 'instagram' && selectedPage.instagramAccount) {
+      if (serviceCode === 'instagram') {
+        if (!selectedPage.instagramAccount) {
+          return res.status(400).json({ success: false, error: 'Esta página no tiene cuenta de Instagram Business vinculada. Vincula una cuenta de Instagram a tu página de Facebook primero.' });
+        }
         creds.instagram_account_id = selectedPage.instagramAccount.id;
         creds.instagram_username = selectedPage.instagramAccount.username;
       }
@@ -501,7 +506,11 @@ const getAvailableAccounts = async (req, res) => {
       }
     } else {
       const pages = creds.available_pages || [];
-      accounts = pages.map(p => ({
+      // Para Instagram, solo mostrar páginas que tengan cuenta IG Business vinculada
+      const filteredPages = serviceCode === 'instagram'
+        ? pages.filter(p => p.instagramAccount)
+        : pages;
+      accounts = filteredPages.map(p => ({
         id: p.pageId,
         name: p.pageName,
         category: p.category,

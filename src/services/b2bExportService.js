@@ -49,6 +49,7 @@ async function generateExcel(areaId, dateFrom, dateTo) {
        i.status,
        i.assigned_agent,
        i.agent_result,
+       i.agent_results,
        i.filter_result,
        i.raw_text,
        i.human_reviewer,
@@ -66,28 +67,55 @@ async function generateExcel(areaId, dateFrom, dateTo) {
     [areaId, dateFrom, dateTo]
   );
 
-  const rows = result.rows;
+  // Expand multi-agent rows: if agent_results has multiple entries, create one row per advisor
+  let rows = result.rows;
+  const expandedRows = [];
+  for (const row of rows) {
+    const agentResults = row.agent_results;
+    if (Array.isArray(agentResults) && agentResults.length > 1) {
+      for (const ar of agentResults) {
+        expandedRows.push({
+          ...row,
+          agent_result: ar.result,
+          _evaluated_agent: ar.agent_label,
+          _multi_agent: true
+        });
+      }
+    } else {
+      expandedRows.push({ ...row, _evaluated_agent: null, _multi_agent: false });
+    }
+  }
+  rows = expandedRows;
+  const hasMultiAgent = rows.some(r => r._multi_agent);
+
   const hasV2 = rows.some(r => r.agent_result && Array.isArray(r.agent_result.criterios));
 
-  // Check if agent has a deliverable template (client-defined export format)
+  // Fetch ALL agent templates for the area (each agent may have a different template)
   const agentTemplateResult = await query(
-    `SELECT ag.deliverable_template
+    `SELECT ag.name, ag.deliverable_template
      FROM b2b_agents ag
      WHERE ag.b2b_area_id = $1 AND ag.type = 'specialized' AND ag.is_active = true
-       AND ag.deliverable_template IS NOT NULL AND ag.deliverable_template != ''
-     LIMIT 1`,
+       AND ag.deliverable_template IS NOT NULL AND ag.deliverable_template != ''`,
     [areaId]
   );
+  // Map agent name → deliverable_template for per-interaction matching
+  const agentTemplateMap = {};
+  for (const at of agentTemplateResult.rows) {
+    agentTemplateMap[at.name.toLowerCase()] = at.deliverable_template;
+  }
+  // Use the first available as default fallback
   const deliverableTemplate = agentTemplateResult.rows[0]?.deliverable_template;
-  const hasEntregable = rows.some(r => r.agent_result?.entregable && Object.keys(r.agent_result.entregable).length > 0);
+  const hasEntregable = rows.some(r => r.agent_result?.entregable && typeof r.agent_result.entregable === 'object' && !Array.isArray(r.agent_result.entregable) && Object.keys(r.agent_result.entregable).length > 0);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = 'NeuroChat B2B';
   wb.created = new Date();
 
-  if (hasEntregable && deliverableTemplate) {
-    // Use client's deliverable template format
-    await buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, deliverableTemplate);
+  if (deliverableTemplate && hasV2) {
+    // Use client's deliverable template — build entregable from criterios if needed
+    await buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, deliverableTemplate, agentTemplateMap);
+  } else if (hasEntregable && deliverableTemplate) {
+    await buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, deliverableTemplate, agentTemplateMap);
   } else if (hasEntregable) {
     // Auto-build from entregable keys (evaluation template-based)
     await buildAutoEntregableWorkbook(wb, rows, areaName, dateFrom, dateTo);
@@ -293,13 +321,14 @@ async function buildV2Workbook(wb, rows, areaName, dateFrom, dateTo) {
     }
 
     const pct = ar.porcentaje != null ? Number(ar.porcentaje) : null;
+    const v2AgentDisplay = row._evaluated_agent ? `${row.assigned_agent || '-'} (${row._evaluated_agent})` : (row.assigned_agent || '-');
 
     const values = [
       idx + 1,
       row.source_id || row.id.substring(0, 8),
       row.channel === 'call' ? 'Llamada' : row.channel === 'email' ? 'Email' : (row.channel || '-'),
       statusLabel(row.status),
-      row.assigned_agent || '-',
+      v2AgentDisplay,
       ar.puntaje_total != null ? `${ar.puntaje_total}/${ar.puntaje_maximo || '?'}` : '-',
       pct != null ? `${pct.toFixed(1)}%` : '-',
       Array.isArray(ar.puntos_criticos_fallidos) && ar.puntos_criticos_fallidos.length > 0
@@ -410,13 +439,14 @@ async function buildLegacyWorkbook(wb, rows, areaName, dateFrom, dateTo) {
     wsRow.height = 22;
 
     const cal = ar.calificacion != null ? Number(ar.calificacion) : null;
+    const legacyAgentDisplay = row._evaluated_agent ? `${row.assigned_agent || '-'} (${row._evaluated_agent})` : (row.assigned_agent || '-');
 
     const values = [
       idx + 1,
       row.source_id || row.id.substring(0, 8),
       row.channel === 'call' ? 'Llamada' : row.channel === 'email' ? 'Email' : (row.channel || '-'),
       statusLabel(row.status),
-      row.assigned_agent || '-',
+      legacyAgentDisplay,
       cal != null ? `${cal}/10` : '-',
       ar.cumple_protocolo ? 'Si' : 'No',
       ar.resumen || '-',
@@ -529,13 +559,185 @@ function buildTranscriptSheet(wb, rows) {
   ws.views = [{ state: 'frozen', ySplit: 1, activeCell: 'A2' }];
 }
 
+// ─── Entregable builder from criterios ──────────────────────────
+
+/**
+ * Normalize a string for fuzzy matching: lowercase, remove accents, trim
+ */
+function normalizeForMatch(str) {
+  return String(str || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+
+/**
+ * Aggressive normalize: also remove common Spanish filler words for fuzzy column matching
+ */
+function normalizeAggressive(str) {
+  return normalizeForMatch(str).replace(/\b(de|del|la|las|los|el|en|y|con|por|para|al|a)\b/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Match a deliverable template column name to a criterion from agent_result.criterios.
+ * Uses substring matching since template columns use short names
+ * (e.g., "Saludo y presentación") while criterios use full names
+ * (e.g., "Etiqueta Telefónica - Saludo y presentación").
+ */
+function matchCriterionToColumn(colName, criterios) {
+  if (!criterios || !Array.isArray(criterios)) return null;
+  const normCol = normalizeForMatch(colName);
+  if (!normCol || normCol.length < 3) return null;
+
+  // 1. Exact match on nombre
+  let match = criterios.find(c => normalizeForMatch(c.nombre) === normCol);
+  if (match) return match;
+
+  // 2. Column name is contained in criterion nombre (e.g., "Tono y voz" in "Etiqueta Telefónica - Tono de Voz")
+  match = criterios.find(c => normalizeForMatch(c.nombre).includes(normCol));
+  if (match) return match;
+
+  // 3. Criterion nombre is contained in column name
+  match = criterios.find(c => {
+    const normNombre = normalizeForMatch(c.nombre);
+    return normNombre.length >= 5 && normCol.includes(normNombre);
+  });
+  if (match) return match;
+
+  // 4. Fuzzy: compare the last part after " - " (the specific criterion)
+  match = criterios.find(c => {
+    const nombre = c.nombre || '';
+    const parts = nombre.split(' - ');
+    if (parts.length > 1) {
+      const specific = normalizeForMatch(parts[parts.length - 1]);
+      return specific.length >= 5 && (normCol.includes(specific) || specific.includes(normCol));
+    }
+    return false;
+  });
+  if (match) return match;
+
+  // 5. Aggressive: strip filler words (de, en, la, etc.) and retry
+  const aggCol = normalizeAggressive(colName);
+  if (aggCol.length >= 5) {
+    match = criterios.find(c => {
+      const aggNombre = normalizeAggressive(c.nombre);
+      return aggNombre.includes(aggCol) || aggCol.includes(aggNombre);
+    });
+    if (match) return match;
+
+    // Also try aggressive on the specific part after " - "
+    match = criterios.find(c => {
+      const parts = (c.nombre || '').split(' - ');
+      if (parts.length > 1) {
+        const aggSpecific = normalizeAggressive(parts[parts.length - 1]);
+        return aggSpecific.length >= 5 && (aggCol.includes(aggSpecific) || aggSpecific.includes(aggCol));
+      }
+      return false;
+    });
+    if (match) return match;
+  }
+
+  return null;
+}
+
+/**
+ * Build entregable object from criterios + deliverable template columns.
+ * Returns { colName: "SI"/"NO"/value } for each non-metadata column.
+ */
+function buildEntregableFromCriterios(row, columns) {
+  const ar = row.agent_result || {};
+  const criterios = ar.criterios || [];
+  const entregable = {};
+
+  // Track which criterios have been matched to avoid double-matching
+  const matchedCriterioIds = new Set();
+
+  for (const col of columns) {
+    // Skip metadata columns (autoFillMetadata handles these)
+    if (autoFillMetadata(col, row, 0) !== null) continue;
+
+    const normCol = normalizeForMatch(col);
+
+    // Special columns
+    if (normCol.includes('puntaje') || normCol === '%' || normCol.includes('porcentaje') || normCol.includes('calificacion')) {
+      // Show percentage for general score columns
+      entregable[col] = ar.porcentaje != null ? `${Number(ar.porcentaje).toFixed(1)}%` : '-';
+      continue;
+    }
+    if (normCol.includes('comentario') || normCol.includes('observacion') || normCol.includes('resumen')) {
+      entregable[col] = ar.resumen || ar.observaciones_autonomas || '-';
+      continue;
+    }
+    if (normCol.includes('motivo') && normCol.includes('monitoreo')) {
+      entregable[col] = row.filter_result?.categoria || row.assigned_agent || '-';
+      continue;
+    }
+    if (normCol.includes('cuenta') || normCol.includes('numero de cuenta')) {
+      entregable[col] = row.source_id || '-';
+      continue;
+    }
+    if (normCol.includes('momento') && normCol.includes('verdad')) {
+      entregable[col] = row.filter_result?.categoria || '-';
+      continue;
+    }
+    if (normCol.includes('usuario') && normCol.includes('asesor')) {
+      entregable[col] = row.assigned_agent || '-';
+      continue;
+    }
+    if (normCol.includes('etiqueta') && normCol.includes('color')) {
+      const pct = ar.porcentaje;
+      if (pct != null) {
+        entregable[col] = pct >= 80 ? 'Verde' : pct >= 50 ? 'Amarillo' : 'Rojo';
+      } else {
+        entregable[col] = '-';
+      }
+      continue;
+    }
+
+    // Try to match to a criterion
+    // Filter out already matched criterios to handle duplicates in template
+    const availableCriterios = criterios.filter(c => !matchedCriterioIds.has(c.id));
+    let criterion = matchCriterionToColumn(col, availableCriterios);
+
+    // If no match in available, try all criterios
+    if (!criterion) criterion = matchCriterionToColumn(col, criterios);
+
+    if (criterion) {
+      entregable[col] = criterion.cumple ? 'SI' : 'NO';
+      if (criterion.id != null) matchedCriterioIds.add(criterion.id);
+    } else {
+      entregable[col] = '-';
+    }
+  }
+
+  return entregable;
+}
+
 // ─── Template-based workbook (client's deliverable format) ──────
 
 function parseTemplateColumns(templateText) {
-  const lines = templateText.split('\n').filter(l => l.trim() && !l.trim().startsWith('==='));
+  const lines = templateText.split('\n').filter(l => l.trim() && !l.trim().startsWith('===') && !l.trim().match(/^[-|\s]+$/));
   if (lines.length === 0) return [];
   const headerLine = lines[0];
-  return headerLine.split('|').map(h => h.trim()).filter(Boolean);
+  const allCols = headerLine.split('|').map(h => h.trim()).filter(Boolean);
+
+  // Filter out SharePoint/system metadata columns that are not relevant to evaluation
+  const JUNK_PATTERNS = [
+    /^id\.?\s*de\s*activo/i, /^tipo\s*de\s*contenido/i, /^modificado$/i,
+    /^created$/i, /^author$/i, /^modificado\s*por$/i, /^versi[oó]n$/i,
+    /^datos\s*adjuntos$/i, /^editar$/i, /^tipo$/i, /^n[uú]mero\s*secundario/i,
+    /^recuento\s*secundario/i, /^configuraci[oó]n\s*de\s*la\s*etiqueta$/i,
+    /^etiqueta\s*de\s*retenci[oó]n/i, /^usuario\s*que\s*ha\s*aplicado/i,
+    /^el\s*elemento\s*es/i, /^aplicaci[oó]n\s*creada/i, /^aplicaci[oó]n\s*modificada/i,
+    /^field_\d+$/i, /^cumplimiento\s*normativo/i
+  ];
+
+  return allCols.filter(col => {
+    const norm = col.trim();
+    if (!norm) return false;
+    // Only filter junk if columns > 20 (clearly has SharePoint metadata mixed in)
+    if (allCols.length > 20) {
+      return !JUNK_PATTERNS.some(p => p.test(norm));
+    }
+    return true;
+  });
 }
 
 /**
@@ -548,20 +750,31 @@ function autoFillMetadata(colName, row, idx) {
   if (/^(n|nro|no|num|numero|#)$/i.test(cl)) return idx + 1;
   // ID / recording ID
   if (cl.includes('id') && (cl.includes('grab') || cl.includes('llamada') || cl.includes('inter') || cl.includes('caso'))) return row.source_id || row.id.substring(0, 8);
-  // Agent name
-  if (cl.includes('agente') || cl.includes('asesor') || cl.includes('ejecutivo') || cl.includes('operador')) return row.assigned_agent || '-';
+  // Just "ID" alone
+  if (/^id$/i.test(cl.trim())) return row.source_id || row.id.substring(0, 8);
+  // Asesor Evaluado (multi-agent: which advisor was evaluated in this row)
+  if (cl.includes('asesor evaluado') || cl.includes('evaluado')) return row._evaluated_agent || '-';
+  // Agent name — if multi-agent, append which advisor
+  if (cl.includes('agente') || cl.includes('asesor') || cl.includes('ejecutivo') || cl.includes('operador')) {
+    const base = row.assigned_agent || '-';
+    return row._evaluated_agent ? `${base} (${row._evaluated_agent})` : base;
+  }
+  // Title (often = agent/evaluator name or interaction title)
+  if (/^title$/i.test(cl.trim())) return row.assigned_agent || '-';
   // Channel
   if (cl.includes('canal') || cl.includes('channel')) return row.channel === 'call' ? 'Llamada' : (row.channel || '-');
   // Status
   if (cl.includes('estado') || cl.includes('status')) return statusLabel(row.status);
-  // Date
-  if (cl.includes('fecha') || cl.includes('date')) return fmtDate(row.created_at);
-  // Reviewer
-  if (cl.includes('revisor') || cl.includes('supervisor') || cl.includes('monitor')) return row.human_reviewer || (row.status === 'aprobado' ? 'Automatico' : '-');
+  // Date (general or specific patterns)
+  if (/^fecha$/i.test(cl.trim()) || cl.includes('fecha monitoreo') || cl.includes('date')) return fmtDate(row.created_at);
+  // Reviewer / evaluator / monitor name (exclude "monitoreo" which is monitoring reason, not reviewer)
+  if (cl.includes('revisor') || cl.includes('supervisor') || (cl.includes('monitor') && !cl.includes('monitoreo')) || cl.includes('evaluador') || cl.includes('nombre del evaluador')) return row.human_reviewer || (row.status === 'aprobado' ? 'Automatico' : '-');
+  // Account number
+  if (cl.includes('cuenta') && !cl.includes('recuento')) return row.source_id || '-';
   return null; // no match — use AI value
 }
 
-async function buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, templateText) {
+async function buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, templateText, agentTemplateMap = {}) {
   const ws = wb.addWorksheet('Entregable', {
     properties: { tabColor: { argb: COLORS.brand } }
   });
@@ -636,7 +849,25 @@ async function buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, templ
   for (let idx = 0; idx < rows.length; idx++) {
     const row = rows[idx];
     const ar = row.agent_result || {};
-    const entregable = ar.entregable || {};
+    // Use AI entregable if it's a valid object with matching keys; otherwise build from criterios
+    let entregable = {};
+    const aiEntregable = ar.entregable;
+    if (aiEntregable && typeof aiEntregable === 'object' && !Array.isArray(aiEntregable)) {
+      // Check if AI entregable has at least some matching column keys
+      const aiKeys = Object.keys(aiEntregable);
+      const matchCount = aiKeys.filter(k => columns.some(c => normalizeForMatch(c) === normalizeForMatch(k))).length;
+      if (matchCount >= 2) {
+        entregable = aiEntregable;
+      }
+    }
+    // If AI entregable is empty/bad, build from criterios
+    if (Object.keys(entregable).length === 0 && Array.isArray(ar.criterios) && ar.criterios.length > 0) {
+      // Use per-agent template if available (different agents may have different column mappings)
+      const agentKey = (row.assigned_agent || '').toLowerCase();
+      const agentTemplate = agentTemplateMap[agentKey];
+      const agentColumns = agentTemplate ? parseTemplateColumns(agentTemplate) : columns;
+      entregable = buildEntregableFromCriterios(row, agentColumns);
+    }
     const rowNum = startRow + 1 + idx;
     const wsRow = ws.getRow(rowNum);
     wsRow.height = 22;
@@ -645,7 +876,7 @@ async function buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, templ
       const col = columns[i];
       const cell = wsRow.getCell(i + 1);
 
-      // Priority: 1) auto-fill metadata, 2) AI entregable value, 3) fallback "-"
+      // Priority: 1) auto-fill metadata, 2) built entregable value, 3) fallback "-"
       const metaValue = autoFillMetadata(col, row, idx);
       let value;
       if (metaValue !== null) {

@@ -382,7 +382,14 @@ function createAIClient(aiConfig, type = 'auditor') {
             max_tokens: 8192, // Increased for deep reasoning and large batches
             response_format: { type: 'json_object' }
           });
-          return JSON.parse(response.choices[0].message.content);
+          const result = JSON.parse(response.choices[0].message.content);
+          const usage = response.usage ? {
+            inputTokens: response.usage.prompt_tokens,
+            outputTokens: response.usage.completion_tokens,
+            totalTokens: response.usage.total_tokens,
+            model,
+          } : null;
+          return { result, usage };
         });
       }
     };
@@ -428,7 +435,8 @@ async function filterInteraction(text, customPrompt, aiConfig, agents = [], accu
     ? agents.map(agent => {
         const name = typeof agent === 'string' ? agent : agent.name;
         const desc = typeof agent === 'object' && agent.description ? ` (${agent.description})` : '';
-        return `- ${name}${desc}`;
+        const hint = typeof agent === 'object' && agent.filter_hint ? `\n  Diferenciacion: ${agent.filter_hint}` : '';
+        return `- ${name}${desc}${hint}`;
       }).join('\n')
     : '- otro: no hay agentes configurados';
     
@@ -454,8 +462,8 @@ Responde estrictamente en JSON:
   "razon": "Breve explicación de por qué elegiste esta categoría" 
 }`;
 
-  const filterResult = await callAI(dynamicPrompt, `Interacción a clasificar:\n\n${text}`);
-  let categoria = filterResult.categoria || 'otro';
+  const { result: filterResultRaw, usage: filterUsage } = await callAI(dynamicPrompt, `Interacción a clasificar:\n\n${text}`);
+  let categoria = filterResultRaw.categoria || 'otro';
 
   // Robust matching: Try exact, then normalized
   if (![...agentNames, 'otro'].includes(categoria)) {
@@ -464,7 +472,7 @@ Responde estrictamente en JSON:
     categoria = match || 'otro';
   }
 
-  return { categoria, confidence: filterResult.confidence || 0.5, razon: filterResult.razon || '' };
+  return { categoria, confidence: filterResultRaw.confidence || 0.5, razon: filterResultRaw.razon || '', _usage: filterUsage };
 }
 
 // ─── Step 3: Prompt Building v2 (5 layers) ──────────────────────
@@ -499,7 +507,7 @@ ${template}`);
   }
 
   if (agent.feedback_accumulated) {
-    parts.push(`\n═══ RETROALIMENTACIÓN ACUMULADA (APRENDIZAJE) ═══\nMejoras de sesiones anteriores:\n${agent.feedback_accumulated}`);
+    parts.push(`\n═══ RETROALIMENTACIÓN ACUMULADA (APRENDIZAJE) ═══\nMejoras de sesiones anteriores:\n${agent.feedback_accumulated}\n\nNOTA: Esta retroalimentación es aprendizaje de auditorías reales. Si hay conflicto con la plantilla de calificación, la retroalimentación tiene PRIORIDAD porque refleja correcciones de un auditor humano.`);
   }
 
   parts.push(`\n═══ FORMATO JSON DE RESPUESTA ═══\n${DEFAULT_DELIVERABLE_TEMPLATE}\nResponde ÚNICAMENTE con JSON válido.`);
@@ -544,34 +552,71 @@ async function analyzeInteraction(text, agentOrCriteria, aiConfig) {
     ? { ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(templateRows)) }
     : agentOrCriteria;
 
-  // Reduced CHUNK_SIZE (max 5 items) to prevent response truncation
+  // Chunk size: self-hosted Qwen2.5-72B (128K context) can handle more criteria per call
   const CHUNK_SIZE = isJsonTemplate && templateRows ? Math.min(5, Math.ceil(templateRows.length / 2)) : 5;
 
   if (!isJsonTemplate || !templateRows || templateRows.length <= CHUNK_SIZE) {
     const fullPrompt = buildFullPromptV2(agentForAI);
-    const result = await callAI(fullPrompt, `Interacción a analizar:\n\n${text}`);
-    return processEvaluationResult(result, agentOrCriteria, templateRows);
+    const { result, usage } = await callAI(fullPrompt, `Interacción a analizar:\n\n${text}`);
+    return { ...processEvaluationResult(result, agentOrCriteria, templateRows), _usage: usage };
   }
 
   const totalChunks = Math.ceil(templateRows.length / CHUNK_SIZE);
-  const chunkResults = [];
 
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkRows = templateRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-    const chunkPrompt = buildFullPromptV2({ ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(chunkRows)) });
-    const chunkUserMsg = `═══ TAREA DE ESPECIALISTA (Lote ${i+1}/${totalChunks}) ═══\nEvalúa EXCLUSIVAMENTE los IDs: ${chunkRows.map(r => r._id).join(', ')}.\nRecuerda: evalúa el ESPÍRITU del criterio, no las palabras exactas. Si el asesor cumplió el objetivo con su propio estilo → CUMPLE.\n\nInteracción:\n${text}`;
+  // Run all chunks in parallel — each evaluates a different set of criteria IDs, fully independent
+  const chunkResolvedResults = await Promise.all(
+    Array.from({ length: totalChunks }, (_, i) => {
+      const chunkRows = templateRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+      const chunkPrompt = buildFullPromptV2({ ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(chunkRows)) });
+      const chunkUserMsg = `═══ TAREA DE ESPECIALISTA (Lote ${i+1}/${totalChunks}) ═══\nEvalúa EXCLUSIVAMENTE los IDs: ${chunkRows.map(r => r._id).join(', ')}.\nRecuerda: evalúa el ESPÍRITU del criterio, no las palabras exactas. Si el asesor cumplió el objetivo con su propio estilo → CUMPLE.\n\nInteracción:\n${text}`;
+      return callAI(chunkPrompt, chunkUserMsg);
+    })
+  );
+  const chunkResults = chunkResolvedResults.map(r => r.result);
+  const chunkUsages = chunkResolvedResults.map(r => r.usage).filter(Boolean);
 
-    let result = await callAI(chunkPrompt, chunkUserMsg);
-    chunkResults.push(result);
-  }
-
-  return consolidateWithDirector(chunkResults, text, agentOrCriteria, templateRows, aiConfig);
+  const directorResult = await consolidateWithDirector(chunkResults, text, agentOrCriteria, templateRows, aiConfig);
+  // Merge all chunk usages + director usage
+  const allUsages = [...chunkUsages, directorResult._usage].filter(Boolean);
+  const mergedUsage = allUsages.length > 0 ? {
+    inputTokens: allUsages.reduce((s, u) => s + (u.inputTokens || 0), 0),
+    outputTokens: allUsages.reduce((s, u) => s + (u.outputTokens || 0), 0),
+    totalTokens: allUsages.reduce((s, u) => s + (u.totalTokens || 0), 0),
+    model: allUsages[0].model,
+  } : null;
+  return { ...directorResult, _usage: mergedUsage };
 }
 
 async function consolidateWithDirector(chunkResults, transcript, agent, templateRows, aiConfig) {
   const { callAI } = createAIClient(aiConfig, 'auditor');
   const auditorCriteria = chunkResults.flatMap(r => r.criterios || []);
   const auditorSummaries = chunkResults.map(r => r.resumen).filter(Boolean);
+
+  // Build deliverable template section for the director if agent has one
+  let entregableInstruction = '';
+  if (agent.deliverable_template) {
+    let deliverableColumns = [];
+    const dtTrimmed = agent.deliverable_template.trim();
+    if (dtTrimmed.startsWith('[')) {
+      try {
+        const rows = JSON.parse(dtTrimmed);
+        if (Array.isArray(rows) && rows.length > 0) {
+          deliverableColumns = Object.keys(rows[0]).filter(k => k && k !== '_id' && k !== 'id');
+        }
+      } catch (e) { /* ignore */ }
+    }
+    if (deliverableColumns.length === 0) {
+      const lines = agent.deliverable_template.split('\n').filter(l => l.trim() && !l.trim().startsWith('===') && !l.trim().match(/^-+(\s*\|\s*-+)*$/));
+      if (lines.length > 0) {
+        deliverableColumns = lines[0].split('|').map(h => h.trim()).filter(Boolean);
+      }
+    }
+    if (deliverableColumns.length > 0) {
+      entregableInstruction = `\n6. ENTREGABLE: Genera un objeto "entregable" con estas columnas: ${JSON.stringify(deliverableColumns)}. Para cada columna, pon "SI" o "NO" según el criterio correspondiente. Columnas de puntaje/score → porcentaje. Columnas de comentario/observación → resumen.`;
+    }
+  }
+
+  const entregableJsonField = entregableInstruction ? ', "entregable": { "columna": "SI/NO", ... }' : '';
 
   const directorPrompt = `Eres el DIRECTOR DE CALIDAD. Consolida los resultados de los auditores.
 PLANTILLA: ${JSON.stringify(templateRows.map(r => ({ id: r._id, Nombre: r.Nombre })), null, 2)}
@@ -583,10 +628,10 @@ INSTRUCCIONES:
 2. IMPORTANTE: Los Nombres de los criterios ya son únicos y corresponden a filas de Excel específicas. NO los agrupes ni modifiques sus IDs.
 3. REVISIÓN DE JUSTICIA: Si un auditor marcó NO CUMPLE pero su observación describe que el asesor SÍ realizó la acción (con palabras diferentes al protocolo), CORRIGE a CUMPLE. El asesor merece crédito si logró el objetivo aunque con estilo propio.
 4. Calcula el % final sumando los pesos de los criterios marcados como CUMPLE.
-5. Responde ÚNICAMENTE con JSON: { "porcentaje": 0-100, "calificacion": 0-10, "resumen": "string", "criterios": [...], "observacion_audio": "string" }`;
+5. Responde ÚNICAMENTE con JSON: { "porcentaje": 0-100, "calificacion": 0-10, "resumen": "string", "criterios": [...]${entregableJsonField}, "observacion_audio": "string" }${entregableInstruction}`;
 
-  const finalResult = await callAI(directorPrompt, "Genera el reporte final consolidado.");
-  return processEvaluationResult(finalResult, agent, templateRows);
+  const { result: finalResultRaw, usage: directorUsage } = await callAI(directorPrompt, "Genera el reporte final consolidado.");
+  return { ...processEvaluationResult(finalResultRaw, agent, templateRows), _usage: directorUsage };
 }
 
 function processEvaluationResult(result, agentOrCriteria, templateRows, lockedCriteriaValues) {
@@ -733,31 +778,28 @@ async function reprocessInteraction(text, agentOrCriteria, previousResult, human
     return _callReprocessAI(text, agentForAI, previousResult, humanFeedback, aiConfig);
   }
 
-  // Chunked reprocess
+  // Chunked reprocess — run all chunks in parallel
   const totalChunks = Math.ceil(templateRows.length / CHUNK_SIZE);
-  const chunkResults = [];
 
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkRows = templateRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-    
-    // Filter previous findings relevant only to this chunk to keep prompt small
-    const chunkPrevResult = {
-      ...previousResult,
-      criterios: Array.isArray(previousResult?.criterios) 
-        ? previousResult.criterios.filter(c => chunkRows.some(r => r._id === Number(c.id)))
-        : []
-    };
-
-    const result = await _callReprocessAI(
-      text, 
-      { ...agentOrCriteria, evaluation_template: JSON.stringify(chunkRows) }, 
-      chunkPrevResult, 
-      humanFeedback, 
-      aiConfig,
-      ` (Lote ${i+1}/${totalChunks})`
-    );
-    chunkResults.push(result);
-  }
+  const chunkResults = await Promise.all(
+    Array.from({ length: totalChunks }, (_, i) => {
+      const chunkRows = templateRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+      const chunkPrevResult = {
+        ...previousResult,
+        criterios: Array.isArray(previousResult?.criterios)
+          ? previousResult.criterios.filter(c => chunkRows.some(r => r._id === Number(c.id)))
+          : []
+      };
+      return _callReprocessAI(
+        text,
+        { ...agentOrCriteria, evaluation_template: JSON.stringify(chunkRows) },
+        chunkPrevResult,
+        humanFeedback,
+        aiConfig,
+        ` (Lote ${i+1}/${totalChunks})`
+      );
+    })
+  );
 
   return consolidateWithDirector(chunkResults, text, agentOrCriteria, templateRows, aiConfig);
 }
@@ -812,8 +854,9 @@ Interacción:
 ${text}`;
   }
 
-  const result = await callAI(fullPrompt, contextMessage);
-  return processEvaluationResult(result, agentOrCriteria, null);
+  const { result: rawResult, usage } = await callAI(fullPrompt, contextMessage);
+  const processed = processEvaluationResult(rawResult, agentOrCriteria, null);
+  return { ...processed, _usage: usage };
 }
 
 /**
@@ -888,8 +931,9 @@ async function distillFeedback(rawFeedback, aiConfig) {
 Feedback: "${rawFeedback}"`;
 
   try {
-    const distilled = await callAI(prompt, "Genera regla general.");
-    return (distilled.trim() === 'NO_VALOR' || distilled.length < 5) ? null : distilled.trim();
+    const { result: distilled } = await callAI(prompt, "Genera regla general.");
+    const text = distilled.regla || distilled.rule || distilled.resumen || distilled.feedback || (typeof distilled === 'string' ? distilled : JSON.stringify(distilled));
+    return (text.trim() === 'NO_VALOR' || text.length < 5) ? null : text.trim();
   } catch (e) { return null; }
 }
 
@@ -901,7 +945,7 @@ Si el feedback NO trata sobre clasificación o asignación de agente, responde N
 Feedback: "${rawFeedback}"`;
 
   try {
-    const distilled = await callAI(prompt, "Extrae regla de clasificación o responde NO_VALOR.");
+    const { result: distilled } = await callAI(prompt, "Extrae regla de clasificación o responde NO_VALOR.");
     const text = distilled.rule || distilled.regla || distilled.categoria || (typeof distilled === 'string' ? distilled : '');
     if (!text || text.includes('NO_VALOR')) return null;
     return text;
@@ -912,13 +956,13 @@ Feedback: "${rawFeedback}"`;
 
 async function generateSystemPrompt(description, aiConfig) {
   const { callAI } = createAIClient(aiConfig, 'filter');
-  const result = await callAI(`Genera criterios de evaluación CX para: ${description}. Responde JSON { "system_prompt": "..." }`, "Generar prompt.");
+  const { result } = await callAI(`Genera criterios de evaluación CX para: ${description}. Responde JSON { "system_prompt": "..." }`, "Generar prompt.");
   return result.system_prompt || '';
 }
 
 async function suggestAgentName(description, aiConfig) {
   const { callAI } = createAIClient(aiConfig, 'filter');
-  const result = await callAI(`Sugiere nombre corto (2-4 palabras) para: ${description}. Responde JSON { "name": "..." }`, "Sugerir nombre.");
+  const { result } = await callAI(`Sugiere nombre corto (2-4 palabras) para: ${description}. Responde JSON { "name": "..." }`, "Sugerir nombre.");
   return result.name || '';
 }
 

@@ -242,11 +242,12 @@ const createClient = async (req, res) => {
       const passwordHash = await hashPassword(password);
 
       // Crear cliente
+      const creatorId = req.user.id === 'admin-env' ? null : req.user.id;
       const clientResult = await client.query(`
         INSERT INTO clients (email, password_hash, name, phone, status, email_verified, created_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING *
-      `, [email.toLowerCase(), passwordHash, name, phone, CLIENT_STATUS.ACTIVE, true, req.user.id]);
+      `, [email.toLowerCase(), passwordHash, name, phone, CLIENT_STATUS.ACTIVE, true, creatorId]);
 
       const newClient = clientResult.rows[0];
 
@@ -516,6 +517,20 @@ const updateClientService = async (req, res) => {
   }
 };
 
+const deleteClientService = async (req, res) => {
+  try {
+    const { clientId, serviceId } = req.params;
+    await query(
+      'DELETE FROM client_services WHERE client_id = $1 AND id = $2',
+      [clientId, serviceId]
+    );
+    res.json({ success: true, message: 'Servicio eliminado correctamente' });
+  } catch (error) {
+    console.error('Error en deleteClientService:', error);
+    res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+};
+
 // ==================== GESTIÓN DE PAGOS ====================
 
 const getPayments = async (req, res) => {
@@ -602,12 +617,13 @@ const validatePayment = async (req, res) => {
     await transaction(async (client) => {
       const newStatus = approved ? PAYMENT_STATUS.COMPLETED : PAYMENT_STATUS.FAILED;
 
+      const validatedBy = req.user.id === 'admin-env' ? null : req.user.id;
       // Actualizar pago
       await client.query(`
         UPDATE payments
         SET status = $1, validated_by = $2, validated_at = CURRENT_TIMESTAMP, notes = $3, updated_at = CURRENT_TIMESTAMP
         WHERE id = $4
-      `, [newStatus, req.user.id, notes, id]);
+      `, [newStatus, validatedBy, notes, id]);
 
       // Si se aprobó, activar el servicio
       if (approved && payment.client_service_id) {
@@ -862,17 +878,19 @@ const updateBankDetails = async (req, res) => {
       SELECT id FROM system_config WHERE key = 'bank_details'
     `);
 
+    const adminId = req.user.id === 'admin-env' ? null : req.user.id;
+
     if (existingResult.rows.length > 0) {
       await query(`
         UPDATE system_config
         SET value = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2
         WHERE key = 'bank_details'
-      `, [bankDetails, req.user.id]);
+      `, [bankDetails, adminId]);
     } else {
       await query(`
         INSERT INTO system_config (key, value, created_by)
         VALUES ('bank_details', $1, $2)
-      `, [bankDetails, req.user.id]);
+      `, [bankDetails, adminId]);
     }
 
     res.json({
@@ -986,17 +1004,19 @@ const updateMetaConfig = async (req, res) => {
       SELECT id FROM system_config WHERE key = 'meta_api_config'
     `);
 
+    const adminId = req.user.id === 'admin-env' ? null : req.user.id;
+
     if (existingResult.rows.length > 0) {
       await query(`
         UPDATE system_config
         SET value = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2
         WHERE key = 'meta_api_config'
-      `, [metaConfig, req.user.id]);
+      `, [metaConfig, adminId]);
     } else {
       await query(`
         INSERT INTO system_config (key, value, created_by)
         VALUES ('meta_api_config', $1, $2)
-      `, [metaConfig, req.user.id]);
+      `, [metaConfig, adminId]);
     }
 
     res.json({
@@ -1118,17 +1138,19 @@ const updateTelegramConfig = async (req, res) => {
       SELECT id FROM system_config WHERE key = 'telegram_config'
     `);
 
+    const adminId = req.user.id === 'admin-env' ? null : req.user.id;
+
     if (existingResult.rows.length > 0) {
       await query(`
         UPDATE system_config
         SET value = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2
         WHERE key = 'telegram_config'
-      `, [telegramConfig, req.user.id]);
+      `, [telegramConfig, adminId]);
     } else {
       await query(`
         INSERT INTO system_config (key, value, created_by)
         VALUES ('telegram_config', $1, $2)
-      `, [telegramConfig, req.user.id]);
+      `, [telegramConfig, adminId]);
     }
 
     res.json({
@@ -1735,6 +1757,7 @@ module.exports = {
   deleteClient,
   assignService,
   updateClientService,
+  deleteClientService,
   getPayments,
   validatePayment,
   getTrials,

@@ -4,6 +4,7 @@ const XLSX = require('xlsx');
 const { query, transaction } = require('../config/database');
 const { encrypt, decrypt } = require('../utils/encryption');
 const { generateSystemPrompt, suggestAgentName } = require('../services/b2bAgentService');
+const { getClientTokenUsage } = require('../services/b2bTokenService');
 
 // ─── B2B Admin Controller ──────────────────────────────────────
 // CRUD operations for B2B clients, areas, and agents.
@@ -394,7 +395,7 @@ async function createArea(req, res) {
 
     // Fetch agents for response
     const agents = await query(
-      'SELECT id, type, name, system_prompt, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at FROM b2b_agents WHERE b2b_area_id = $1 ORDER BY type, name',
+      'SELECT id, type, name, system_prompt, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at, multi_agent_enabled, multi_agent_config FROM b2b_agents WHERE b2b_area_id = $1 ORDER BY type, name',
       [result.id]
     );
 
@@ -425,6 +426,10 @@ async function listAgents(req, res) {
   try {
     const { areaId } = req.params;
 
+    if (!areaId || areaId === 'undefined') {
+      return res.status(400).json({ success: false, error: 'Invalid area ID' });
+    }
+
     // Get area + client info (with ownership check for B2B clients)
     let areaCheck;
     if (req.b2bClient) {
@@ -448,7 +453,7 @@ async function listAgents(req, res) {
     const maxAgents = limitResult.rows[0]?.max_agents_per_area || 5;
 
     const result = await query(
-      `SELECT id, type, name, system_prompt, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at, updated_at
+      `SELECT id, type, name, system_prompt, description, filter_hint, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at, updated_at, multi_agent_enabled, multi_agent_config
        FROM b2b_agents
        WHERE b2b_area_id = $1
        ORDER BY type, name`,
@@ -475,9 +480,9 @@ async function listAgents(req, res) {
 async function updatePrompt(req, res) {
   try {
     const { agentId } = req.params;
-    const { system_prompt, name, description, evaluation_template, deliverable_template, feedback_accumulated } = req.body;
+    const { system_prompt, name, description, evaluation_template, deliverable_template, feedback_accumulated, filter_hint, multi_agent_enabled, multi_agent_config } = req.body;
 
-    const hasAnyField = [system_prompt, name, description, evaluation_template, deliverable_template, feedback_accumulated]
+    const hasAnyField = [system_prompt, name, description, evaluation_template, deliverable_template, feedback_accumulated, filter_hint, multi_agent_enabled, multi_agent_config]
       .some(f => f !== undefined);
 
     if (!hasAnyField) {
@@ -525,6 +530,10 @@ async function updatePrompt(req, res) {
       updates.push(`feedback_accumulated = $${paramIndex++}`);
       values.push(feedback_accumulated);
     }
+    if (filter_hint !== undefined) {
+      updates.push(`filter_hint = $${paramIndex++}`);
+      values.push(filter_hint);
+    }
     if (name !== undefined) {
       const trimmed = name.trim();
       if (!trimmed) {
@@ -547,6 +556,14 @@ async function updatePrompt(req, res) {
       updates.push(`name = $${paramIndex++}`);
       values.push(trimmed);
     }
+    if (multi_agent_enabled !== undefined) {
+      updates.push(`multi_agent_enabled = $${paramIndex++}`);
+      values.push(!!multi_agent_enabled);
+    }
+    if (multi_agent_config !== undefined) {
+      updates.push(`multi_agent_config = $${paramIndex++}`);
+      values.push(multi_agent_config ? JSON.stringify(multi_agent_config) : null);
+    }
 
     updates.push('updated_at = CURRENT_TIMESTAMP');
     values.push(agentId);
@@ -554,7 +571,7 @@ async function updatePrompt(req, res) {
     const result = await query(
       `UPDATE b2b_agents SET ${updates.join(', ')}
        WHERE id = $${paramIndex}
-       RETURNING id, type, name, system_prompt, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, updated_at`,
+       RETURNING id, type, name, system_prompt, description, filter_hint, evaluation_template, deliverable_template, feedback_accumulated, is_active, updated_at, multi_agent_enabled, multi_agent_config`,
       values
     );
 
@@ -653,7 +670,7 @@ async function generatePromptEndpoint(req, res) {
 async function createAgent(req, res) {
   try {
     const { areaId } = req.params;
-    const { name, system_prompt, description, evaluation_template, deliverable_template } = req.body;
+    const { name, system_prompt, description, filter_hint, evaluation_template, deliverable_template } = req.body;
 
     if (!name) {
       return res.status(400).json({
@@ -712,10 +729,10 @@ async function createAgent(req, res) {
     }
 
     const result = await query(
-      `INSERT INTO b2b_agents (b2b_area_id, type, name, system_prompt, description, evaluation_template, deliverable_template)
-       VALUES ($1, 'specialized', $2, $3, $4, $5, $6)
-       RETURNING id, type, name, system_prompt, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at`,
-      [areaId, name, system_prompt || null, description || null, evaluation_template || null, deliverable_template || null]
+      `INSERT INTO b2b_agents (b2b_area_id, type, name, system_prompt, description, filter_hint, evaluation_template, deliverable_template)
+       VALUES ($1, 'specialized', $2, $3, $4, $5, $6, $7)
+       RETURNING id, type, name, system_prompt, description, filter_hint, evaluation_template, deliverable_template, feedback_accumulated, is_active, created_at`,
+      [areaId, name, system_prompt || null, description || null, filter_hint || null, evaluation_template || null, deliverable_template || null]
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -921,7 +938,8 @@ function guessDefaultType(sample, keys) {
 async function uploadTemplate(req, res) {
   try {
     const { agentId } = req.params;
-    const { template_type } = req.body;
+    const { template_type, advisor_index } = req.body;
+    const advisorIdx = advisor_index != null ? parseInt(advisor_index) : null;
 
     if (!template_type || !['evaluation', 'deliverable'].includes(template_type)) {
       return res.status(400).json({
@@ -1015,15 +1033,31 @@ async function uploadTemplate(req, res) {
         }
     }
 
-    // Store in the appropriate column
-    const column = template_type === 'evaluation' ? 'evaluation_template' : 'deliverable_template';
-
-    const result = await query(
-      `UPDATE b2b_agents SET ${column} = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING id, type, name, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, updated_at`,
-      [textContent.trim(), agentId]
-    );
+    // Store in the appropriate column (or per-advisor template inside multi_agent_config)
+    let result;
+    if (advisorIdx != null && template_type === 'evaluation') {
+      // Save per-advisor template into multi_agent_config.advisor_templates[N]
+      result = await query(
+        `UPDATE b2b_agents
+         SET multi_agent_config = jsonb_set(
+           COALESCE(multi_agent_config, '{"advisor_templates":{}}'),
+           ARRAY['advisor_templates', $1::text],
+           to_jsonb($2::text),
+           true
+         ), updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3
+         RETURNING id, type, name, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, updated_at, multi_agent_enabled, multi_agent_config`,
+        [String(advisorIdx), textContent.trim(), agentId]
+      );
+    } else {
+      const column = template_type === 'evaluation' ? 'evaluation_template' : 'deliverable_template';
+      result = await query(
+        `UPDATE b2b_agents SET ${column} = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2
+         RETURNING id, type, name, description, evaluation_template, deliverable_template, feedback_accumulated, is_active, updated_at, multi_agent_enabled, multi_agent_config`,
+        [textContent.trim(), agentId]
+      );
+    }
 
     if (!result.rows[0]) {
       return res.status(404).json({ success: false, error: 'Agent not found' });
@@ -1071,6 +1105,18 @@ async function addCriterion(req, res) {
     const raw = agentResult.rows[0].evaluation_template;
     if (raw && raw.trim().startsWith('[')) {
       try { criteria = JSON.parse(raw); } catch { criteria = []; }
+    }
+
+    // Validate unique name
+    const newName = String(newCriterion.Nombre || newCriterion.nombre || newCriterion.Criterio || '').trim().toLowerCase();
+    if (newName) {
+      const exists = criteria.some(c => {
+        const existing = String(c.Nombre || c.nombre || c.Criterio || '').trim().toLowerCase();
+        return existing === newName;
+      });
+      if (exists) {
+        return res.status(409).json({ success: false, error: 'Ya existe un criterio con ese nombre' });
+      }
     }
 
     // Auto-assign next ID
@@ -1175,6 +1221,18 @@ async function deleteCriterion(req, res) {
   }
 }
 
+async function getTokenUsage(req, res) {
+  try {
+    const { clientId } = req.params;
+    const days = parseInt(req.query.days) || 30;
+    const data = await getClientTokenUsage(clientId, days);
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('[B2B Admin] getTokenUsage error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
 module.exports = {
   listClients,
   createClient,
@@ -1192,4 +1250,5 @@ module.exports = {
   deleteCriterion,
   generatePrompt: generatePromptEndpoint,
   detectPullFields,
+  getTokenUsage,
 };

@@ -25,9 +25,15 @@ async function sendTelegramText(botToken, chatId, text, options = {}) {
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
 
+    // Escapar caracteres especiales HTML para evitar que Telegram corte el mensaje
+    // La IA no genera HTML, pero sí puede incluir < > & en precios, comparaciones, etc.
+    const safeText = options.parse_mode
+      ? text
+      : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
     const data = {
       chat_id: chatId,
-      text: text,
+      text: safeText,
       parse_mode: options.parse_mode || 'HTML',
       disable_web_page_preview: options.disable_preview !== false
     };

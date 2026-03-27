@@ -117,11 +117,12 @@ async function receiveCall(req, res) {
     }
 
     // Create interaction with placeholder raw_text (will be replaced after transcription)
+    const audioFilename = source_id || (audio_url ? require('path').basename(new URL(audio_url).pathname) : null);
     const result = await query(
-      `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash)
-       VALUES ($1, 'call', $2, '[pendiente transcripción]', 'recibido', $3)
+      `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash, audio_filename)
+       VALUES ($1, 'call', $2, '[pendiente transcripción]', 'recibido', $3, $4)
        RETURNING id`,
-      [area_id, source_id || audio_url, audioHash]
+      [area_id, source_id || audio_url, audioHash, audioFilename]
     );
     const interactionId = result.rows[0].id;
 

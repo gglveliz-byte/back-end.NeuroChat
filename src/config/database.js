@@ -11,11 +11,7 @@ const pool = new Pool({
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
-});
-
-// Establecer esquema por defecto
-pool.on('connect', (client) => {
-  client.query('SET search_path TO chatbot_saas, public');
+  options: '-c search_path=chatbot_saas,public'
 });
 
 // Función helper para queries

@@ -17,7 +17,9 @@ router.post('/:code/conversations/:conversationId/messages', serviceController.s
 router.put('/:code/conversations/:conversationId/bot', serviceController.toggleBot);
 router.put('/:code/conversations/:conversationId/attended', serviceController.markAttended);
 router.put('/:code/conversations/:conversationId/archive', serviceController.archiveConversation);
+router.delete('/:code/conversations/:conversationId', serviceController.deleteConversation);
 router.delete('/:code/conversations/:conversationId/messages', serviceController.clearMessages);
+router.put('/:code/conversations/:conversationId/tags', serviceController.updateConversationTags);
 
 // Configuración del bot
 router.get('/:code/config', serviceController.getBotConfig);

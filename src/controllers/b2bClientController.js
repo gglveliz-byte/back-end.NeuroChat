@@ -1,14 +1,14 @@
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
-const crypto = require('crypto');
 const { query } = require('../config/database');
 const { generateB2BToken } = require('../middlewares/b2bAuth');
 const { generateExcel } = require('../services/b2bExportService');
 const { addJob, isQueueReady } = require('../queues/b2bQueue');
 const { transcribeAudioFromBufferFull, diarizeTranscription } = require('../services/b2bTranscriptionService');
-const { stepFilter, stepAnalyze, stepSelectiveReprocess, clearAgentFeedback } = require('../services/b2bPipelineService');
+const { stepFilter, stepAnalyze, getFilterAgent, accumulateFeedback } = require('../services/b2bPipelineService');
 
 // ─── B2B Client Controller ─────────────────────────────────────
 // Endpoints for B2B client panel: login, interactions, review, export.
@@ -212,15 +212,9 @@ async function getInteraction(req, res) {
     const { id } = req.params;
 
     const result = await query(
-      `SELECT i.*, a.display_name AS area_name, a.name AS area_code,
-              ag.evaluation_template,
-              (i.agent_result->>'calificacion')::numeric AS calificacion,
-              (i.agent_result->>'porcentaje')::numeric AS porcentaje
+      `SELECT i.*, a.display_name AS area_name, a.name AS area_code
        FROM b2b_interactions i
        JOIN b2b_areas a ON i.b2b_area_id = a.id
-       LEFT JOIN b2b_agents ag ON ag.b2b_area_id = i.b2b_area_id 
-          AND ag.type = 'specialized'
-          AND LOWER(ag.name) = LOWER(i.assigned_agent)
        WHERE i.id = $1 AND a.b2b_client_id = $2`,
       [id, b2bClientId]
     );
@@ -229,75 +223,7 @@ async function getInteraction(req, res) {
       return res.status(404).json({ success: false, error: 'Interaction not found' });
     }
 
-    const interaction = result.rows[0];
-
-    // Enrich criteria with dynamic columns from the Excel template
-    if (interaction.agent_result && Array.isArray(interaction.agent_result.criterios) && interaction.evaluation_template) {
-      if (!interaction.agent_result.template_headers) {
-        const templateText = interaction.evaluation_template.trim();
-        
-        // Handle new JSON Array format
-        if (templateText.startsWith('[')) {
-          try {
-            const rows = JSON.parse(templateText);
-            if (rows.length > 0) {
-              const headers = Object.keys(rows[0]).filter(k => k !== '_id');
-              
-              interaction.agent_result.criterios = interaction.agent_result.criterios.map(c => {
-                // If the AI result already has template_data (from the agent service), use it.
-                if (c.template_data) return c;
-                
-                let matchedRow;
-                if (c.id != null) {
-                   matchedRow = rows.find(r => r._id === Number(c.id));
-                } else {
-                   // Legacy name match fallback
-                   matchedRow = rows.find(r => Object.values(r).some(v => typeof v === 'string' && v.trim().toLowerCase() === (c.nombre || '').toLowerCase()));
-                }
-
-                if (matchedRow) {
-                  const { _id, ...cleanRow } = matchedRow;
-                  return { ...c, template_data: cleanRow };
-                }
-                return c;
-              });
-              interaction.agent_result.template_headers = headers;
-            }
-          } catch (e) {
-            console.error("[B2B Client] Error parsing JSON evaluation_template:", e);
-          }
-        } 
-        // Handle legacy Text format
-        else {
-          const lines = templateText.split('\n').filter(l => l.trim() && !l.trim().startsWith('==='));
-          if (lines.length >= 2) {
-            const headers = lines[0].split('|').map(h => h.trim());
-            const rows = [];
-            for (let i = 1; i < lines.length; i++) {
-              if (lines[i].includes('---')) continue;
-              const cols = lines[i].split('|').map(c => c.trim());
-              const rowObj = {};
-              headers.forEach((h, idx) => { rowObj[h] = cols[idx] || ''; });
-              rows.push(rowObj);
-            }
-   
-            interaction.agent_result.criterios = interaction.agent_result.criterios.map(c => {
-              const matchedRow = rows.find(r => Object.values(r).some(v => typeof v === 'string' && v.trim().toLowerCase() === (c.nombre || '').toLowerCase()));
-              if (matchedRow) {
-                return { ...c, template_data: matchedRow };
-              }
-              return c;
-            });
-            interaction.agent_result.template_headers = headers;
-          }
-        }
-      }
-    }
-
-    // evaluation_template is intentionally kept in the response so the frontend
-    // can render the full criteria table and support the selective-reprocess panel.
-
-    res.json({ success: true, data: interaction });
+    res.json({ success: true, data: result.rows[0] });
 
   } catch (error) {
     console.error('[B2B Client] getInteraction error:', error);
@@ -408,10 +334,6 @@ async function approveReview(req, res) {
       [reviewer || req.b2bClient.contact_name, id]
     );
 
-    // Save evaluation history snapshot (survives future deletion)
-    const { saveEvaluationHistory } = require('../services/b2bPipelineService');
-    setImmediate(() => saveEvaluationHistory(id));
-
     res.json({ success: true, data: result.rows[0] });
 
   } catch (error) {
@@ -466,54 +388,23 @@ async function rejectReview(req, res) {
       [reviewer || req.b2bClient.contact_name, feedback, id]
     );
 
-    // ─── Accumulate feedback into the assigned agent (Smart Learning) ───
+    // ─── Accumulate feedback into the assigned agent (permanent improvement) ───
+    // Get the interaction's assigned_agent and area to find the agent record
     const interactionData = await query(
-      `SELECT i.assigned_agent, i.b2b_area_id, c.ai_provider, c.ai_api_key, c.ai_model
-       FROM b2b_interactions i 
-       JOIN b2b_areas a ON i.b2b_area_id = a.id
-       JOIN b2b_clients c ON a.b2b_client_id = c.id
-       WHERE i.id = $1`,
+      `SELECT i.assigned_agent, i.b2b_area_id
+       FROM b2b_interactions i WHERE i.id = $1`,
       [id]
     );
-
     if (interactionData.rows[0]?.assigned_agent) {
-      const { assigned_agent, b2b_area_id, ai_provider, ai_api_key, ai_model } = interactionData.rows[0];
-      
-      // Attempt to distill specific feedback into a general rule
-      const { distillFeedback, distillFilterFeedback } = require('../services/b2bAgentService');
-      
-      const config = { ai_provider, ai_api_key, ai_model };
-
-      // 1. Audit Rule (for the specialized agent)
-      const distilledRule = await distillFeedback(feedback, config);
-      if (distilledRule) {
-        await query(
-          `UPDATE b2b_agents
-           SET feedback_accumulated = COALESCE(feedback_accumulated, '') || E'\n- ' || $1,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE b2b_area_id = $2 AND name = $3 AND type = 'specialized'`,
-          [distilledRule, b2b_area_id, assigned_agent]
-        );
-        console.log(`[B2B Client] Smart Learning: Added audit rule to agent "${assigned_agent}": ${distilledRule}`);
-      }
-
-      // 2. Filter Rule (for the categorization agent)
-      const filterRule = await distillFilterFeedback(feedback, config);
-      if (filterRule) {
-        await query(
-          `UPDATE b2b_agents
-           SET feedback_accumulated = COALESCE(feedback_accumulated, '') || E'\n- ' || $1,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE b2b_area_id = $2 AND type = 'filter'`,
-          [filterRule, b2b_area_id]
-        );
-        console.log(`[B2B Client] Smart Learning: Added filter rule for area ${b2b_area_id}: ${filterRule}`);
-      }
+      const { assigned_agent, b2b_area_id } = interactionData.rows[0];
+      await query(
+        `UPDATE b2b_agents
+         SET feedback_accumulated = COALESCE(feedback_accumulated, '') || E'\n- ' || $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE b2b_area_id = $2 AND name = $3 AND type = 'specialized'`,
+        [feedback, b2b_area_id, assigned_agent]
+      );
     }
-
-    // Save evaluation history snapshot (with human corrections)
-    const { saveEvaluationHistory } = require('../services/b2bPipelineService');
-    setImmediate(() => saveEvaluationHistory(id));
 
     // Enqueue reprocessing
     await addJob('reprocess', { interactionId: id, humanFeedback: feedback });
@@ -675,57 +566,136 @@ async function uploadAudio(req, res) {
       return res.status(404).json({ success: false, error: 'Area not found' });
     }
 
-    // Compute SHA-256 of the audio buffer for content-based deduplication
-    const audioHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+    // Extract buffer and create SHA-256 hash (full file, more reliable than MD5)
+    const audioBuffer = Buffer.from(req.file.buffer);
+    const audio_hash = crypto.createHash('sha256').update(audioBuffer).digest('hex').substring(0, 64);
 
-    // Check if this exact audio content was already processed
+    // Check if this exact audio was already processed in this area
     const hashMatch = await query(
-      `SELECT id, status, created_at FROM b2b_interactions
-       WHERE b2b_area_id = $1 AND audio_hash = $2
-       AND status NOT IN ('error_cola', 'error_transcripcion', 'error_filtro', 'error_analisis', 'error_reproceso')
-       ORDER BY created_at DESC LIMIT 1`,
-      [area_id, audioHash]
+      `SELECT i.id, i.status, i.audio_filename,
+              eh.agent_result AS cached_result
+       FROM b2b_interactions i
+       LEFT JOIN b2b_evaluation_history eh
+         ON eh.audio_hash = i.audio_hash AND eh.b2b_area_id = i.b2b_area_id
+       WHERE i.b2b_area_id = $1 AND i.audio_hash = $2
+         AND i.status NOT IN ('error_cola', 'error_transcripcion', 'error_filtro', 'error_analisis', 'error_reproceso')
+       ORDER BY i.created_at DESC LIMIT 1`,
+      [area_id, audio_hash]
     );
     if (hashMatch.rows[0]) {
-      // Check if the agent template was updated AFTER the last evaluation
-      // If so, allow re-evaluation with the new template
-      const agentUpdated = await query(
-        `SELECT ag.updated_at FROM b2b_agents ag
-         JOIN b2b_areas a ON a.id = $1
-         WHERE ag.b2b_area_id = $1 AND ag.is_active = true
-         ORDER BY ag.updated_at DESC LIMIT 1`,
-        [area_id]
-      );
-      const agentLastUpdate = agentUpdated.rows[0]?.updated_at;
-      const evalCreatedAt = hashMatch.rows[0].created_at;
+      const prev = hashMatch.rows[0];
 
-      if (!agentLastUpdate || new Date(agentLastUpdate) <= new Date(evalCreatedAt)) {
-        // Template hasn't changed — return existing evaluation
-        return res.status(200).json({
+      // Check if the agent's criteria changed since last evaluation
+      let criteriaChanged = false;
+      if (prev.cached_result) {
+        const agentRow = await query(
+          `SELECT evaluation_template FROM b2b_agents
+           WHERE b2b_area_id = $1 AND is_active = true
+           ORDER BY created_at DESC LIMIT 1`,
+          [area_id]
+        );
+        const template = agentRow.rows[0]?.evaluation_template;
+        if (template && template.trim().startsWith('[')) {
+          try {
+            const currentCriteria = JSON.parse(template);
+            const prevCriterios = prev.cached_result.criterios || [];
+            const currentNames = currentCriteria
+              .filter(c => (c['Tipo de Error'] || '').toLowerCase() !== 'no aplica')
+              .map(c => {
+                const s = c['Criterio Específico'] || c['criterio específico'] || '';
+                const g = c['Criterio a evaluar'] || c['criterio a evaluar'] || '';
+                return (s && s.toLowerCase() !== 'no aplica') ? `${g} - ${s}`.toLowerCase().trim()
+                  : String(c.Criterio || c.criterio || c.nombre || '').toLowerCase().trim();
+              }).filter(Boolean);
+            const prevNames = prevCriterios.map(c => String(c.nombre || c.Criterio || '').toLowerCase().trim()).filter(Boolean);
+            const maxSize = Math.max(currentNames.length, prevNames.length);
+            if (maxSize > 0) {
+              let matches = 0;
+              for (const cn of currentNames) {
+                if (prevNames.some(pn => cn === pn || cn.includes(pn) || pn.includes(cn))) matches++;
+              }
+              if ((matches / maxSize) < 0.7) criteriaChanged = true;
+            }
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Only simulate pipeline if criteria haven't changed (cached result is still valid)
+      if (!criteriaChanged && prev.cached_result) {
+        // Create a fresh interaction so the user sees a new entry in the list
+        const simResult = await query(
+          `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash, audio_filename)
+           VALUES ($1, 'call', $2, '[pendiente transcripcion]', 'recibido', $3, $4)
+           RETURNING id`,
+          [area_id, `upload_${req.file.originalname}`, audio_hash, req.file.originalname]
+        );
+        const simId = simResult.rows[0].id;
+        const cachedResult = prev.cached_result;
+        const cachedRawText = (await query('SELECT raw_text, filter_result, assigned_agent, voice_metrics FROM b2b_interactions WHERE id = $1', [prev.id])).rows[0];
+
+        // Respond immediately — simulation runs in background
+        res.status(201).json({
           success: true,
           data: {
-            interaction_id: hashMatch.rows[0].id,
-            status: hashMatch.rows[0].status,
-            already_processed: true,
-            message: 'Este audio ya fue evaluado anteriormente (contenido idéntico detectado)'
+            interaction_id: simId,
+            status: 'recibido',
+            audio_filename: req.file.originalname,
+            area: areaCheck.rows[0].display_name,
+            pipeline_mode: 'cached_simulation',
+            message: 'Audio recibido, analizando...'
           }
         });
+
+        // Simulate the full pipeline with realistic delays (runs after response is sent)
+        setImmediate(async () => {
+          const delay = (ms) => new Promise(r => setTimeout(r, ms));
+          try {
+            await query("UPDATE b2b_interactions SET status = 'transcribiendo' WHERE id = $1", [simId]);
+            await delay(3000 + Math.random() * 3000); // 3-6s — feels like Whisper
+
+            await query("UPDATE b2b_interactions SET status = 'transcrito', raw_text = $1, voice_metrics = $2 WHERE id = $3",
+              [cachedRawText?.raw_text || '', cachedRawText?.voice_metrics || null, simId]);
+            await delay(1500 + Math.random() * 1500); // 1.5-3s
+
+            await query("UPDATE b2b_interactions SET status = 'filtrando' WHERE id = $1", [simId]);
+            await delay(1000 + Math.random() * 1000); // 1-2s
+
+            await query(
+              "UPDATE b2b_interactions SET filter_result = $1, assigned_agent = $2, status = 'filtrado' WHERE id = $3",
+              [cachedRawText?.filter_result || null, cachedRawText?.assigned_agent || null, simId]
+            );
+            await delay(500);
+
+            await query("UPDATE b2b_interactions SET status = 'analizando' WHERE id = $1", [simId]);
+            await delay(2000 + Math.random() * 2000); // 2-4s — feels like GPT
+
+            // Apply cached result to new interaction
+            await query(
+              `UPDATE b2b_interactions
+               SET agent_result = $1, status = 'en_revision', processed_at = CURRENT_TIMESTAMP
+               WHERE id = $2`,
+              [JSON.stringify(cachedResult), simId]
+            );
+          } catch (err) {
+            console.error('[B2B] Cache simulation error:', err.message);
+            await query("UPDATE b2b_interactions SET status = 'error_analisis' WHERE id = $1", [simId]).catch(() => {});
+          }
+        });
+
+        return; // Response already sent
       }
-      // Template changed after last evaluation — allow re-evaluation
-      console.log(`[B2B Upload] Audio hash match found but agent template updated after last eval (${agentLastUpdate} > ${evalCreatedAt}). Allowing re-evaluation.`);
+      // If criteria changed or no cached result: fall through to full pipeline
     }
 
-    // 1. Create interaction as 'recibido'
+    // 1. Create interaction as 'recibido', including the hash and filename
     const interResult = await query(
-      `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash)
-       VALUES ($1, 'call', $2, '[pendiente transcripcion]', 'recibido', $3)
+      `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash, audio_filename)
+       VALUES ($1, 'call', $2, '[pendiente transcripcion]', 'recibido', $3, $4)
        RETURNING id`,
-      [area_id, `upload_${req.file.originalname}`, audioHash]
+      [area_id, `upload_${req.file.originalname}`, audio_hash, req.file.originalname]
     );
     const interactionId = interResult.rows[0].id;
 
-    // Save the buffer before responding (req.file.buffer won't be available after response)
-    const audioBuffer = Buffer.from(req.file.buffer);
     const audioFileName = req.file.originalname;
     const areaName = areaCheck.rows[0].display_name;
 
@@ -786,10 +756,6 @@ async function deleteInteraction(req, res) {
     if (!check.rows[0]) {
       return res.status(404).json({ success: false, error: 'Interaction not found' });
     }
-
-    // Save evaluation history BEFORE deleting (memory that survives deletion)
-    const { saveEvaluationHistory } = require('../services/b2bPipelineService');
-    await saveEvaluationHistory(id);
 
     await query('DELETE FROM b2b_interactions WHERE id = $1', [id]);
 
@@ -886,7 +852,6 @@ async function updateProcessingMode(req, res) {
         processing_mode: result.rows[0].processing_mode
       }
     });
-
   } catch (error) {
     console.error('[B2B Client] updateProcessingMode error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -895,56 +860,35 @@ async function updateProcessingMode(req, res) {
 
 /**
  * POST /api/v1/b2b/interactions/:id/selective-reprocess
- * Re-evaluate only specific criteria chosen by the human reviewer.
- * Body: {
- *   locked_criteria: number[],           // IDs confirmed correct (keep as-is)
- *   correction_criteria: { id: number, feedback: string }[]  // IDs to fix + why
- * }
+ * Surgical reprocess: fix only specific criteria
  */
 async function selectiveReprocess(req, res) {
   try {
     const b2bClientId = req.b2bClient.id;
-    const { id: interactionId } = req.params;
-    const { locked_criteria = [], correction_criteria = [] } = req.body;
+    const { id } = req.params;
+    const lockedCriteriaIds = req.body.lockedCriteriaIds ?? req.body.locked_criteria;
+    const correctionCriteria = req.body.correctionCriteria ?? req.body.correction_criteria;
 
-    if (!Array.isArray(locked_criteria) || !Array.isArray(correction_criteria)) {
-      return res.status(400).json({ success: false, error: 'locked_criteria and correction_criteria must be arrays' });
-    }
-    if (correction_criteria.length === 0 && locked_criteria.length === 0) {
-      return res.status(400).json({ success: false, error: 'At least one locked or correction criterion is required' });
-    }
-    for (const ci of correction_criteria) {
-      if (ci.id == null || !ci.feedback) {
-        return res.status(400).json({ success: false, error: 'Each correction_criteria item must have id and feedback' });
-      }
+    if (!Array.isArray(lockedCriteriaIds) || !Array.isArray(correctionCriteria)) {
+      return res.status(400).json({ success: false, error: 'lockedCriteriaIds and correctionCriteria (arrays) are required' });
     }
 
-    // Verify interaction belongs to this client
-    const intCheck = await query(
-      `SELECT i.id, i.status FROM b2b_interactions i
+    // Verify ownership
+    const check = await query(
+      `SELECT i.id FROM b2b_interactions i
        JOIN b2b_areas a ON i.b2b_area_id = a.id
        WHERE i.id = $1 AND a.b2b_client_id = $2`,
-      [interactionId, b2bClientId]
+      [id, b2bClientId]
     );
-    if (!intCheck.rows[0]) {
+    if (!check.rows[0]) {
       return res.status(404).json({ success: false, error: 'Interaction not found' });
     }
 
-    const lockedIds = locked_criteria.map(Number);
-    const corrItems = correction_criteria.map(ci => ({ id: Number(ci.id), feedback: ci.feedback }));
+    // Enqueue job
+    const { addJob } = require('../queues/b2bQueue');
+    await addJob('selective_reprocess', { interactionId: id, lockedCriteriaIds, correctionCriteria });
 
-    // Run async but respond immediately
-    res.json({ success: true, data: { interaction_id: interactionId, status: 'reprocesando', message: 'Reproceso quirúrgico iniciado' } });
-
-    setImmediate(async () => {
-      try {
-        await stepSelectiveReprocess(interactionId, lockedIds, corrItems);
-      } catch (err) {
-        console.error('[B2B Client] selectiveReprocess background error:', err);
-        await query("UPDATE b2b_interactions SET status = 'error_reproceso' WHERE id = $1", [interactionId]);
-      }
-    });
-
+    res.json({ success: true, message: 'Operación iniciada (reproceso selectivo)...' });
   } catch (error) {
     console.error('[B2B Client] selectiveReprocess error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -952,30 +896,183 @@ async function selectiveReprocess(req, res) {
 }
 
 /**
+ * PUT /api/v1/b2b/interactions/:id/reassign-agent
+ * Manually change the assigned agent for an interaction
+ */
+async function reassignAgent(req, res) {
+  try {
+    const b2bClientId = req.b2bClient.id;
+    const { id } = req.params;
+    const { agentName, filterFeedback } = req.body;
+
+    if (!agentName) {
+      return res.status(400).json({ success: false, error: 'agentName is required' });
+    }
+
+    // Get current agent + area info (also serves as ownership check)
+    const check = await query(
+      `SELECT i.id, i.assigned_agent, i.b2b_area_id, i.audio_hash
+       FROM b2b_interactions i
+       JOIN b2b_areas a ON i.b2b_area_id = a.id
+       WHERE i.id = $1 AND a.b2b_client_id = $2`,
+      [id, b2bClientId]
+    );
+    if (!check.rows[0]) {
+      return res.status(404).json({ success: false, error: 'Interaction not found' });
+    }
+
+    const { assigned_agent: originalAgent, b2b_area_id: areaId, audio_hash: audioHash } = check.rows[0];
+
+    await query('UPDATE b2b_interactions SET assigned_agent = $1 WHERE id = $2', [agentName, id]);
+
+    // ─── Filter Learning: teach the filter from manual corrections ───
+    if (originalAgent && originalAgent !== agentName) {
+      setImmediate(async () => {
+        try {
+          const filterAgent = await getFilterAgent(areaId);
+          if (filterAgent?.id) {
+            const motivo = filterFeedback?.trim() || 'corrección manual del auditor';
+            const rule = `Cuando una llamada fue clasificada como "${originalAgent}" pero en realidad corresponde a "${agentName}", reclasifica a "${agentName}". Motivo: ${motivo}.`;
+            await accumulateFeedback(filterAgent.id, rule);
+            console.log(`[B2B Filter Learn] Rule added: "${originalAgent}" → "${agentName}"`);
+          }
+
+          // Update evaluation history cache so re-uploads use the corrected agent
+          if (audioHash) {
+            await query(
+              `UPDATE b2b_evaluation_history SET assigned_agent = $1, updated_at = CURRENT_TIMESTAMP
+               WHERE audio_hash = $2 AND b2b_area_id = $3`,
+              [agentName, audioHash, areaId]
+            );
+          }
+        } catch (err) {
+          console.error('[B2B Filter Learn] Error:', err.message);
+        }
+      });
+    }
+
+    res.json({ success: true, message: `Interacción reasignada a "${agentName}"` });
+  } catch (error) {
+    console.error('[B2B Client] reassignAgent error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
  * DELETE /api/v1/b2b/agents/:agentId/feedback
- * Clear all accumulated feedback/learning for an agent (admin reset).
+ * Clear an agent's accumulated feedback
  */
 async function clearFeedback(req, res) {
   try {
     const b2bClientId = req.b2bClient.id;
     const { agentId } = req.params;
 
-    // Verify agent belongs to a client area
-    const agentCheck = await query(
+    // Verify agent ownership
+    const check = await query(
       `SELECT ag.id FROM b2b_agents ag
        JOIN b2b_areas a ON ag.b2b_area_id = a.id
        WHERE ag.id = $1 AND a.b2b_client_id = $2`,
       [agentId, b2bClientId]
     );
-    if (!agentCheck.rows[0]) {
+    if (!check.rows[0]) {
       return res.status(404).json({ success: false, error: 'Agent not found' });
     }
 
+    const { clearAgentFeedback } = require('../services/b2bPipelineService');
     await clearAgentFeedback(agentId);
-    res.json({ success: true, message: 'Memoria del agente limpiada correctamente' });
 
+    res.json({ success: true, message: 'Memoria de feedback borrada' });
   } catch (error) {
     console.error('[B2B Client] clearFeedback error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * POST /api/v1/b2b/upload-text
+ * Upload a text document (PDF, TXT, EML, HTML) or paste raw text.
+ * Skips transcription — goes straight to filter → analyze pipeline.
+ * Body (multipart): file (optional), text (optional), area_id (required)
+ */
+async function uploadText(req, res) {
+  try {
+    const b2bClientId = req.b2bClient.id;
+    const { area_id, text: rawText } = req.body;
+
+    if (!area_id) {
+      return res.status(400).json({ success: false, error: 'area_id is required' });
+    }
+    if (!req.file && !rawText) {
+      return res.status(400).json({ success: false, error: 'Debe subir un archivo o pegar texto' });
+    }
+
+    // Verify area belongs to client
+    const areaCheck = await query(
+      'SELECT id, display_name FROM b2b_areas WHERE id = $1 AND b2b_client_id = $2 AND is_active = true',
+      [area_id, b2bClientId]
+    );
+    if (!areaCheck.rows[0]) {
+      return res.status(404).json({ success: false, error: 'Area not found' });
+    }
+
+    let extractedText = '';
+    let fileName = 'texto_pegado';
+
+    if (req.file) {
+      fileName = req.file.originalname;
+      const ext = fileName.toLowerCase().split('.').pop();
+
+      if (ext === 'pdf') {
+        const pdfParse = require('pdf-parse');
+        const pdfData = await pdfParse(req.file.buffer);
+        extractedText = pdfData.text;
+      } else {
+        // TXT, EML, HTML, CSV, etc. — read as UTF-8
+        extractedText = req.file.buffer.toString('utf-8');
+      }
+    } else {
+      extractedText = rawText;
+    }
+
+    if (!extractedText || extractedText.trim().length < 10) {
+      return res.status(400).json({ success: false, error: 'El texto extraído está vacío o es muy corto' });
+    }
+
+    // Hash for deduplication
+    const textHash = crypto.createHash('md5').update(extractedText).digest('hex');
+
+    // Create interaction — status='transcrito' (text is ready, skip transcription)
+    const interResult = await query(
+      `INSERT INTO b2b_interactions (b2b_area_id, channel, source_id, raw_text, status, audio_hash)
+       VALUES ($1, 'text', $2, $3, 'transcrito', $4)
+       RETURNING id`,
+      [area_id, `text_upload_${fileName}`, extractedText.trim(), textHash]
+    );
+    const interactionId = interResult.rows[0].id;
+    const areaName = areaCheck.rows[0].display_name;
+
+    // Respond immediately
+    res.status(201).json({
+      success: true,
+      data: {
+        interaction_id: interactionId,
+        status: 'transcrito',
+        assigned_agent: null,
+        transcription_preview: extractedText.substring(0, 200),
+        transcription_length: extractedText.length,
+        file_name: fileName,
+        area: areaName,
+        pipeline_mode: 'queued',
+        filter_result: null,
+        message: 'Texto recibido, en cola de procesamiento...'
+      }
+    });
+
+    // Enqueue filter directly — skip transcription
+    await addJob('filter', { interactionId });
+
+  } catch (error) {
+    console.error('[B2B Client] uploadText error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
@@ -991,9 +1088,11 @@ module.exports = {
   createExport,
   downloadExport,
   uploadAudio,
+  uploadText,
   deleteInteraction,
   deleteAllInteractions,
   updateProcessingMode,
   selectiveReprocess,
+  reassignAgent,
   clearFeedback
 };

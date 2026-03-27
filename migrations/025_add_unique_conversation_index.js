@@ -20,7 +20,7 @@ async function run() {
     const dupes = await client.query(`
       DELETE FROM conversations
       WHERE id NOT IN (
-        SELECT MIN(id) FROM conversations
+        SELECT MIN(id::text)::uuid FROM conversations
         GROUP BY client_service_id, contact_id
       )
       RETURNING id

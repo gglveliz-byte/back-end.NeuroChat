@@ -1,13 +1,14 @@
 const { createQueue, checkRedisConnection } = require('../config/redis');
 const { query } = require('../config/database');
-const { stepTranscribe, stepFilter, stepAnalyze, stepReprocess } = require('../services/b2bPipelineService');
+const { stepTranscribe, stepFilter, stepAnalyze, stepReprocess, stepSelectiveReprocess } = require('../services/b2bPipelineService');
 
 // Map job name → status to set on interaction when job fails (after all retries)
 const FAILED_STATUS_BY_JOB = {
   transcribe: 'error_transcripcion',
   filter: 'error_filtro',
   analyze: 'error_analisis',
-  reprocess: 'error_reproceso'
+  reprocess: 'error_reproceso',
+  selective_reprocess: 'error_reproceso'
 };
 
 // ─── B2B Pipeline Queue ─────────────────────────────────────────
@@ -23,7 +24,7 @@ let useMemoryQueue = false;
 const memoryQueue = [];
 let memoryProcessing = false;
 const MEMORY_CONCURRENCY = { transcribe: 1, filter: 2, analyze: 2, reprocess: 1 };
-const activeJobs = { transcribe: 0, filter: 0, analyze: 0, reprocess: 0 };
+const activeJobs = { transcribe: 0, filter: 0, analyze: 0, reprocess: 0, selective_reprocess: 0 };
 
 async function processMemoryJob(job) {
   const { name, data } = job;
@@ -47,6 +48,9 @@ async function processMemoryJob(job) {
         break;
       case 'reprocess':
         await stepReprocess(interactionId, data.humanFeedback);
+        break;
+      case 'selective_reprocess':
+        await stepSelectiveReprocess(interactionId, data.lockedCriteriaIds, data.correctionCriteria);
         break;
     }
 
@@ -154,6 +158,12 @@ async function initB2BQueue() {
       return { step: 'reprocess', interactionId };
     });
 
+    b2bQueue.process('selective_reprocess', 1, async (job) => {
+      const { interactionId, lockedCriteriaIds, correctionCriteria } = job.data;
+      await stepSelectiveReprocess(interactionId, lockedCriteriaIds, correctionCriteria);
+      return { step: 'selective_reprocess', interactionId };
+    });
+
     // ─── Events (throttled) ─────────────────────────────────
     b2bQueue.on('completed', (job, result) => {
       console.log(`[B2B Queue] Job ${job.id} (${job.name}) completed:`, result);
@@ -254,6 +264,24 @@ async function closeQueue() {
   if (b2bQueue) {
     await b2bQueue.close();
     console.log('[B2B Queue] Closed');
+  }
+
+  if (useMemoryQueue) {
+    let waitAttempts = 0;
+    while (memoryQueue.length > 0 || Object.values(activeJobs).some(count => count > 0)) {
+      if (waitAttempts === 0) {
+        console.log('[B2B Queue:Memory] Esperando a que terminen los trabajos activos antes de apagar...');
+      }
+      await new Promise(r => setTimeout(r, 1000));
+      waitAttempts++;
+      if (waitAttempts >= 25) {
+        console.warn('[B2B Queue:Memory] Timeout de 25s alcanzado. Forzando cierre.');
+        break;
+      }
+    }
+    if (waitAttempts > 0 && waitAttempts < 25) {
+      console.log('[B2B Queue:Memory] Shutdown graceful completado, trabajos finalizados.');
+    }
   }
 }
 

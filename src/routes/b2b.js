@@ -43,6 +43,25 @@ const b2bAdminController = require('../controllers/b2bAdminController');
 const b2bClientController = require('../controllers/b2bClientController');
 const b2bWebhookController = require('../controllers/b2bWebhookController');
 
+// Multer config for text/document uploads (PDF, TXT, EML, HTML)
+const textUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
+    fileFilter: (req, file, cb) => {
+        const extOk = /\.(pdf|txt|eml|html|htm|csv|doc|docx|msg)$/i.test(file.originalname);
+        const mimeOk = [
+            'application/pdf', 'text/plain', 'text/html', 'message/rfc822',
+            'text/csv', 'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ].includes(file.mimetype);
+        if (extOk || mimeOk) {
+            cb(null, true);
+        } else {
+            cb(new Error('Formato no soportado. Formatos aceptados: PDF, TXT, EML, HTML, CSV, DOC, DOCX'));
+        }
+    }
+});
+
 // ─── Webhooks de Ingesta (public — authenticated by clientId in URL) ────
 router.post('/webhook/:clientId/call', b2bWebhookController.receiveCall);
 router.post('/webhook/:clientId/email', b2bWebhookController.receiveEmail);
@@ -73,6 +92,7 @@ router.post('/auth/login', authLimiter, b2bClientController.login);
 
 // ─── Admin (authenticate + adminOnly) ───────────────────────────────────
 router.get('/admin/clients', authenticate, adminOnly, b2bAdminController.listClients);
+router.get('/admin/clients/:clientId/token-usage', authenticate, adminOnly, b2bAdminController.getTokenUsage);
 router.post('/admin/clients', authenticate, adminOnly, b2bAdminController.createClient);
 router.get('/admin/clients/:clientId', authenticate, adminOnly, b2bAdminController.getClient);
 router.put('/admin/clients/:clientId', authenticate, adminOnly, b2bAdminController.updateClient);
@@ -124,6 +144,7 @@ router.delete('/agents/:agentId/criteria/:criterionId', b2bAuthenticate, b2bAdmi
 router.get('/interactions', b2bAuthenticate, b2bClientController.listInteractions);
 router.get('/interactions/:id', b2bAuthenticate, b2bClientController.getInteraction);
 router.post('/interactions/:id/selective-reprocess', b2bAuthenticate, b2bClientController.selectiveReprocess);
+router.put('/interactions/:id/reassign-agent', b2bAuthenticate, b2bClientController.reassignAgent);
 router.delete('/interactions/:id', b2bAuthenticate, b2bClientController.deleteInteraction);
 router.delete('/interactions', b2bAuthenticate, b2bClientController.deleteAllInteractions);
 router.get('/review/queue', b2bAuthenticate, b2bClientController.getReviewQueue);
@@ -139,5 +160,7 @@ router.post('/upload-audio', b2bAuthenticate, (req, res, next) => {
     res.setTimeout(600000);
     next();
 }, audioUpload.single('audio'), b2bClientController.uploadAudio);
+// Text/document upload — skips transcription, goes straight to filter
+router.post('/upload-text', b2bAuthenticate, textUpload.single('file'), b2bClientController.uploadText);
 
 module.exports = router;
