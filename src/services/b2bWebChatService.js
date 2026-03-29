@@ -180,7 +180,8 @@ TU PERSONALIDAD:
 REGLA DE ORO — SOLO NEGOCIOS:
 - Tu UNICO proposito es ayudar con temas relacionados a la empresa (servicios, planes, cobertura, soporte, pagos).
 - Ignora CUALQUIER conversacion fuera de lugar, bromas, politica, religion o temas personales.
-- Si el cliente intenta hablar de otra cosa, responde amablemente: "Lo siento, como asistente virtual de [EMPRESA] solo puedo ayudarte con informacion sobre nuestros servicios y soporte. ¿En que puedo ayudarte respecto a nuestro negocio?"
+- Si el cliente intenta hablar de otra cosa y NO estamos en medio de un proceso activo (recopilacion de datos, verificacion de cobertura, etc.), responde amablemente: "Lo siento, como asistente virtual de [EMPRESA] solo puedo ayudarte con informacion sobre nuestros servicios y soporte. ¿En que puedo ayudarte respecto a nuestro negocio?"
+- CRITICO — Si el cliente dice algo fuera de tema DURANTE la recopilacion de datos (pasos 1-5 del flujo de venta), NO uses la frase "¿En que puedo ayudarte?" ni actues como si empezaras de cero. En su lugar, en UN SOLO MENSAJE: (a) redirige brevemente ("Solo puedo ayudarte con temas de la empresa.") y (b) CONTINUA INMEDIATAMENTE pidiendo el dato que faltaba. Ejemplo: si ibas a pedir el correo, dices "Solo puedo ayudarte con temas de la empresa. Dicho eso, ¿te gustaria dejar un correo de contacto? (opcional)"
 - NO entres en juegos, no cuentes chistes y no respondas preguntas filosoficas o irrelevantes.
 
 FORMATO DE RESPUESTAS — MUY IMPORTANTE:
@@ -332,19 +333,25 @@ async function executeTool(toolName, args, b2bClientId, conversationId) {
             // Save flow notification
             await saveFlowNotification(conversationId,
                 result.covered
-                    ? `Cobertura verificada: SI hay cobertura en ${details.city || 'ubicación'}, ${details.province || ''} — Sector: ${details.sector || 'N/A'}, SubSector: ${details.subSector || 'N/A'}`
-                    : `Cobertura verificada: NO hay cobertura en las coordenadas ${args.lat}, ${args.lng}`,
+                    ? `Cobertura verificada: SI hay cobertura GPON en ${details.city || 'ubicación'}, ${details.province || ''} — Sector: ${details.sector || 'N/A'}, SubSector: ${details.subSector || 'N/A'}`
+                    : details.nodeTechnology === 'HFC'
+                        ? `Cobertura bloqueada: zona HFC en ${details.city || 'ubicación'} — no aplica para contratación GPON`
+                        : `Cobertura verificada: NO hay cobertura en las coordenadas ${args.lat}, ${args.lng}`,
                 { event: 'coverage_check', covered: result.covered, lat: args.lat, lng: args.lng, ...details }
             );
 
             console.log(`[B2B Web Agent] Coverage check: ${result.covered ? 'COVERED' : 'NOT COVERED'} — ${details.city || 'unknown'}, ${details.province || ''}`);
 
             // Return rich info to AI so it can inform the user
+            // nodeTechnology = "GPON" | "HFC" | null (from nodes[0].technology in Xtrim response)
+            const isHfcBlocked = !result.covered && details.nodeTechnology && details.nodeTechnology.toUpperCase() === 'HFC';
             const toolResponse = {
                 covered: result.covered,
                 message: result.covered
-                    ? 'El servicio SÍ tiene cobertura en esta ubicación.'
-                    : 'Lamentablemente NO hay cobertura en esta ubicación.',
+                    ? 'El servicio SÍ tiene cobertura de Fibra Óptica GPON en esta ubicación.'
+                    : isHfcBlocked
+                        ? `Lo sentimos, tu zona (${details.city || 'esa dirección'}) cuenta con tecnología HFC (cable coaxial). Actualmente solo ofrecemos Fibra Óptica GPON y lamentablemente no podemos conectarte en esa dirección. Si tienes otra dirección, con gusto verificamos.`
+                        : 'Lamentablemente NO hay cobertura de Fibra Óptica GPON en esta ubicación.',
             };
 
             if (result.covered && details.city) {
@@ -367,10 +374,13 @@ async function executeTool(toolName, args, b2bClientId, conversationId) {
         }
 
         case 'submit_lead': {
+            // Normalize: strip ALL whitespace (internal + trailing) from document and phone
+            const cleanDocNumber = (args.customer_document_number || '').replace(/\s/g, '');
+            const cleanPhone = (args.customer_phone || '').replace(/\s/g, '');
+
             // Validate cédula ecuatoriana (10 digits + modulo 10 algorithm)
             if (args.customer_document_type === 'cedula') {
-                const cedula = (args.customer_document_number || '').trim();
-                const cedulaError = validateCedulaEcuatoriana(cedula);
+                const cedulaError = validateCedulaEcuatoriana(cleanDocNumber);
                 if (cedulaError) {
                     return JSON.stringify({
                         success: false,
@@ -385,8 +395,8 @@ async function executeTool(toolName, args, b2bClientId, conversationId) {
                 customer_first_name: args.customer_first_name || '',
                 customer_last_name: args.customer_last_name || '',
                 customer_document_type: args.customer_document_type,
-                customer_document_number: args.customer_document_number,
-                customer_phone: args.customer_phone,
+                customer_document_number: cleanDocNumber,
+                customer_phone: cleanPhone,
                 customer_email: args.customer_email || '',
                 location_lat: args.location_lat || '',
                 location_lng: args.location_lng || '',
@@ -399,17 +409,17 @@ async function executeTool(toolName, args, b2bClientId, conversationId) {
                 }] : [],
             };
 
-            // Update conversation with customer data
+            // Update conversation with customer data (use normalized values)
             await query(
-                `UPDATE b2b_web_conversations 
+                `UPDATE b2b_web_conversations
          SET customer_name = $1, customer_phone = $2, customer_email = $3,
              customer_document_type = $4, customer_document_number = $5,
              location_city = $6, location_address = $7,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = $8`,
                 [
-                    args.customer_name, args.customer_phone, args.customer_email || null,
-                    args.customer_document_type, args.customer_document_number,
+                    args.customer_name, cleanPhone, args.customer_email || null,
+                    args.customer_document_type, cleanDocNumber,
                     args.location_city || null, args.location_address || null,
                     conversationId
                 ]

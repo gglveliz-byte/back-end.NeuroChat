@@ -29,7 +29,9 @@ const {
     getClientConversations,
     getClientConfig,
     updateClientConfig,
-    getClientConversationDetails
+    getClientConversationDetails,
+    archiveConversation,
+    deleteConversation
 } = require('../controllers/b2bWebClientController');
 
 // ─── Admin Routes (protected: authenticate + adminOnly) ────────
@@ -72,6 +74,8 @@ router.get('/admin/clients/:clientId/web-config/conversations/:convId', authenti
 router.get('/client/stats', b2bAuthenticate, getDashboardStats);
 router.get('/client/conversations', b2bAuthenticate, getClientConversations);
 router.get('/client/conversations/:convId', b2bAuthenticate, getClientConversationDetails);
+router.put('/client/conversations/:convId/archive', b2bAuthenticate, archiveConversation);
+router.delete('/client/conversations/:convId', b2bAuthenticate, deleteConversation);
 router.get('/client/config', b2bAuthenticate, getClientConfig);
 router.put('/client/config', b2bAuthenticate, updateClientConfig);
 

@@ -141,6 +141,7 @@ app.use((req, res, next) => {
     req.path.startsWith('/api/v1/b2b-web/widget') ||
     req.path.startsWith('/api/v1/b2b/auth') ||
     req.path.startsWith('/api/v1/b2b-web/admin') ||
+    req.path.startsWith('/api/v1/b2b-web/client') ||
     req.path.startsWith('/api/v1/b2b/')
   ) {
     res.header('Access-Control-Allow-Origin', req.headers.origin || '*');

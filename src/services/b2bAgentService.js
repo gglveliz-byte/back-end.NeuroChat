@@ -79,6 +79,24 @@ function normalizeName(str) {
     .replace(/[\u0300-\u036f]/g, '');
 }
 
+// ─── Helper: Find the description key in a criterion object ──
+// Template rows come from Excel with varying column names (Descripción, Descripcion, detalle, etc.)
+function findDescriptionKey(objectKeys) {
+  const keysNorm = objectKeys.map(k => normalizeName(k));
+  const descPatterns = ['descripcion', 'descripción', 'detalle', 'regla', 'contexto'];
+  return objectKeys.find((k, i) => descPatterns.some(p => keysNorm[i].includes(p))) || null;
+}
+
+// ─── Helper: Find the criterion name key in a criterion object ──
+function findCriterionNameKey(objectKeys) {
+  const keysNorm = objectKeys.map(k => normalizeName(k));
+  const namePatterns = ['criterio especifico', 'item especifico', 'sub-criterio', 'subcriterio', 'parametro', 'nombre'];
+  const catPatterns = ['criterio a evaluar', 'agrupador', 'categoria'];
+  const itemKey = objectKeys.find((k, i) => namePatterns.some(p => keysNorm[i].includes(p)));
+  if (itemKey) return itemKey;
+  return objectKeys.find((k, i) => catPatterns.some(p => keysNorm[i].includes(p))) || null;
+}
+
 // ─── Helper: Parse column headers from template text ─────────
 function parseTemplateColumns(templateText) {
   const lines = templateText.split('\n').filter(l => l.trim() && !l.trim().startsWith('==='));
@@ -481,7 +499,21 @@ function buildFullPromptV2(agent) {
   if (!hasV2Fields) return buildFullPrompt(agent.system_prompt);
 
   const parts = [FIXED_QUALITY_PROMPT];
-  if (agent.description) parts.push(`\n═══ CONTEXTO DE LA OPERACIÓN ═══\n${agent.description}`);
+
+  // ─── ASESOR TARGETING: Extract which asesor to evaluate from description ───
+  if (agent.description) {
+    parts.push(`\n═══ CONTEXTO DE LA OPERACIÓN ═══\n${agent.description}`);
+    // Detect "asesor 1", "asesor 2", etc. in description and inject targeting rule
+    const asesorMatch = agent.description.match(/asesor\s*(\d+)/i);
+    if (asesorMatch) {
+      parts.push(`\n═══ ASESOR OBJETIVO (REGLA PRIORITARIA) ═══
+IMPORTANTE: En esta transcripción pueden aparecer múltiples asesores (Asesor 1, Asesor 2, etc.).
+Tu tarea es evaluar EXCLUSIVAMENTE al ASESOR ${asesorMatch[1]}.
+IGNORA completamente las acciones, frases y comportamientos de cualquier otro asesor.
+Si un criterio se refiere a algo que hizo otro asesor, NO lo evalúes — solo evalúa al Asesor ${asesorMatch[1]}.
+Cualquier calificación debe basarse ÚNICAMENTE en lo que dijo e hizo el Asesor ${asesorMatch[1]}.`);
+    }
+  }
   if (agent.system_prompt) parts.push(`\n═══ INSTRUCCIONES ESPECÍFICAS DE INTELIGENCIA ═══\n${agent.system_prompt}`);
   
   if (agent.evaluation_template) {
@@ -495,6 +527,10 @@ INSTRUCCIONES CRÍTICAS DE EVALUACIÓN:
 - Un buen asesor puede cumplir un protocolo de muchas formas distintas. Tu trabajo es detectar si el OBJETIVO se cumplió, no si usó un script exacto.
 - Si hay duda razonable y la evidencia sugiere que sí cumplió → dale el beneficio de la duda y marca CUMPLE con observación.
 - Solo marca NO CUMPLE cuando hay ausencia clara y real del comportamiento esperado.
+- Para cada criterio, DEBES incluir un campo "observacion" con un comentario DETALLADO y NARRATIVO que explique:
+  • POR QUÉ cumple o no cumple, citando evidencia específica de la transcripción.
+  • Ejemplo CUMPLE: "Cumple porque en el minuto 2:30 el asesor saludó cordialmente diciendo 'Buenos días, le habla María de Stream' e identificó el motivo de la llamada."
+  • Ejemplo NO CUMPLE: "No cumple porque en toda la llamada el asesor nunca mencionó el ticket de seguimiento ni proporcionó número de referencia al cliente."
 
 ${template}`);
     } else {
@@ -552,8 +588,8 @@ async function analyzeInteraction(text, agentOrCriteria, aiConfig) {
     ? { ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(templateRows)) }
     : agentOrCriteria;
 
-  // Chunk size: self-hosted Qwen2.5-72B (128K context) can handle more criteria per call
-  const CHUNK_SIZE = isJsonTemplate && templateRows ? Math.min(5, Math.ceil(templateRows.length / 2)) : 5;
+  // Chunk size: 2 criteria per assistant for maximum precision and zero hallucination
+  const CHUNK_SIZE = 2;
 
   if (!isJsonTemplate || !templateRows || templateRows.length <= CHUNK_SIZE) {
     const fullPrompt = buildFullPromptV2(agentForAI);
@@ -563,12 +599,25 @@ async function analyzeInteraction(text, agentOrCriteria, aiConfig) {
 
   const totalChunks = Math.ceil(templateRows.length / CHUNK_SIZE);
 
-  // Run all chunks in parallel — each evaluates a different set of criteria IDs, fully independent
+  // Run all chunks in parallel — each evaluates exactly 2 criteria with deep focus
   const chunkResolvedResults = await Promise.all(
     Array.from({ length: totalChunks }, (_, i) => {
       const chunkRows = templateRows.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
       const chunkPrompt = buildFullPromptV2({ ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(chunkRows)) });
-      const chunkUserMsg = `═══ TAREA DE ESPECIALISTA (Lote ${i+1}/${totalChunks}) ═══\nEvalúa EXCLUSIVAMENTE los IDs: ${chunkRows.map(r => r._id).join(', ')}.\nRecuerda: evalúa el ESPÍRITU del criterio, no las palabras exactas. Si el asesor cumplió el objetivo con su propio estilo → CUMPLE.\n\nInteracción:\n${text}`;
+      const chunkUserMsg = `═══ TAREA DE ESPECIALISTA (Lote ${i+1}/${totalChunks}) ═══
+Evalúa EXCLUSIVAMENTE los IDs: ${chunkRows.map(r => r._id).join(', ')}.
+Recuerda: evalúa el ESPÍRITU del criterio, no las palabras exactas. Si el asesor cumplió el objetivo con su propio estilo → CUMPLE.
+
+Para cada criterio, tu campo "observacion" DEBE ser un comentario narrativo DETALLADO explicando:
+- POR QUÉ cumple o no cumple, con evidencia textual de la transcripción.
+- Cita frases específicas del asesor o momentos clave.
+- Ejemplo: "Cumple porque el asesor dijo 'le informo que su ticket es el #134813' en el minuto 5."
+- Ejemplo: "No cumple porque en los primeros 30 segundos el asesor no se identificó ni mencionó la empresa."
+
+Además, genera un campo "resumen_lote" con un breve párrafo narrativo describiendo qué encontraste en estos ${chunkRows.length} criterios.
+
+Interacción:
+${text}`;
       return callAI(chunkPrompt, chunkUserMsg);
     })
   );
@@ -590,7 +639,7 @@ async function analyzeInteraction(text, agentOrCriteria, aiConfig) {
 async function consolidateWithDirector(chunkResults, transcript, agent, templateRows, aiConfig) {
   const { callAI } = createAIClient(aiConfig, 'auditor');
   const auditorCriteria = chunkResults.flatMap(r => r.criterios || []);
-  const auditorSummaries = chunkResults.map(r => r.resumen).filter(Boolean);
+  const auditorSummaries = chunkResults.map((r, i) => r.resumen_lote || r.resumen || '').filter(Boolean);
 
   // Build deliverable template section for the director if agent has one
   let entregableInstruction = '';
@@ -612,23 +661,30 @@ async function consolidateWithDirector(chunkResults, transcript, agent, template
       }
     }
     if (deliverableColumns.length > 0) {
-      entregableInstruction = `\n6. ENTREGABLE: Genera un objeto "entregable" con estas columnas: ${JSON.stringify(deliverableColumns)}. Para cada columna, pon "SI" o "NO" según el criterio correspondiente. Columnas de puntaje/score → porcentaje. Columnas de comentario/observación → resumen.`;
+      entregableInstruction = `\n7. ENTREGABLE: Genera un objeto "entregable" con estas columnas: ${JSON.stringify(deliverableColumns)}. Para cada columna, pon "SI" o "NO" según el criterio correspondiente. Columnas de puntaje/score → porcentaje. Columnas de comentario/observación → resumen.`;
     }
   }
 
   const entregableJsonField = entregableInstruction ? ', "entregable": { "columna": "SI/NO", ... }' : '';
 
-  const directorPrompt = `Eres el DIRECTOR DE CALIDAD. Consolida los resultados de los auditores.
+  const directorPrompt = `Eres el DIRECTOR DE CALIDAD. Consolida los resultados de los auditores especialistas.
 PLANTILLA: ${JSON.stringify(templateRows.map(r => ({ id: r._id, Nombre: r.Nombre })), null, 2)}
-RESULTADOS: ${JSON.stringify(auditorCriteria, null, 2)}
-SUMARIOS: ${auditorSummaries.join('\n\n')}
+RESULTADOS DE LOS AUDITORES (cada uno evaluó un lote de 2 criterios con análisis profundo):
+${JSON.stringify(auditorCriteria, null, 2)}
+
+RESÚMENES DE CADA AUDITOR (mini-reportes por lote):
+${auditorSummaries.map((s, i) => `[Lote ${i+1}]: ${s}`).join('\n')}
 
 INSTRUCCIONES:
 1. Genera un JSON consolidado. Para cada criterio de la PLANTILLA, busca su resultado correspondiente usando el ID como clave principal.
 2. IMPORTANTE: Los Nombres de los criterios ya son únicos y corresponden a filas de Excel específicas. NO los agrupes ni modifiques sus IDs.
 3. REVISIÓN DE JUSTICIA: Si un auditor marcó NO CUMPLE pero su observación describe que el asesor SÍ realizó la acción (con palabras diferentes al protocolo), CORRIGE a CUMPLE. El asesor merece crédito si logró el objetivo aunque con estilo propio.
-4. Calcula el % final sumando los pesos de los criterios marcados como CUMPLE.
-5. Responde ÚNICAMENTE con JSON: { "porcentaje": 0-100, "calificacion": 0-10, "resumen": "string", "criterios": [...]${entregableJsonField}, "observacion_audio": "string" }${entregableInstruction}`;
+4. PRESERVA las "observacion" detalladas de cada auditor. Estas son los comentarios RICOS que explican por qué cada criterio cumple o no cumple con evidencia. NO las resumas ni acortes — son el valor principal del reporte.
+5. Calcula el % final sumando los pesos de los criterios marcados como CUMPLE.
+6. "resumen": Genera un RESUMEN NARRATIVO PROFESIONAL consolidando los mini-reportes de todos los auditores. Debe leerse como un párrafo continuo y descriptivo del tipo:
+   "Titular indica que contrató con otro proveedor... el asesor ofrece alternativas de retención sin éxito, realiza proceso de validación, informa ticket #134813... Se sugiere consultar el nuevo proveedor."
+   Este resumen debe cubrir: qué pidió el cliente, qué hizo el asesor, puntos fuertes, puntos débiles, y una sugerencia si aplica.
+Responde ÚNICAMENTE con JSON: { "porcentaje": 0-100, "calificacion": 0-10, "resumen": "párrafo narrativo profesional largo", "criterios": [...]${entregableJsonField}, "observacion_audio": "string" }${entregableInstruction}`;
 
   const { result: finalResultRaw, usage: directorUsage } = await callAI(directorPrompt, "Genera el reporte final consolidado.");
   return { ...processEvaluationResult(finalResultRaw, agent, templateRows), _usage: directorUsage };
@@ -771,7 +827,7 @@ async function reprocessInteraction(text, agentOrCriteria, previousResult, human
     ? { ...agentOrCriteria, evaluation_template: JSON.stringify(cleanRowsForAI(templateRows)) }
     : agentOrCriteria;
 
-  const CHUNK_SIZE = isJsonTemplate && templateRows ? Math.ceil(templateRows.length / 2) : 6;
+  const CHUNK_SIZE = 2;
 
   // If no chunking needed
   if (!isJsonTemplate || !templateRows || templateRows.length <= CHUNK_SIZE) {
@@ -926,6 +982,41 @@ async function selectiveReprocessInteraction(text, agent, previousResult, locked
   return aiResult;
 }
 
+/**
+ * Detects which criteria IDs are affected by a general human feedback comment using AI context analysis.
+ */
+async function detectAffectedCriteriaByFeedback(agent, previousResult, humanFeedback, aiConfig) {
+  const { callAI } = createAIClient(aiConfig, 'filter'); // use faster model
+
+  if (!humanFeedback || !previousResult?.criterios?.length) return [];
+
+  const criteriaContext = previousResult.criterios.map(c => 
+    `ID: ${c.id} | Criterio: ${c.nombre} | Estado: ${c.cumple ? 'CUMPLE' : 'NO CUMPLE'}`
+  ).join('\n');
+
+  const prompt = `Un auditor humano ha rechazado una evaluación con este comentario general:
+"${humanFeedback}"
+
+Aquí está la lista de todos los criterios evaluados y su estado actual:
+${criteriaContext}
+
+TAREA: Analiza el comentario y determina CUÁLES IDs numéricos de la lista anterior se ven afectados por su queja y necesitan ser re-evaluados por la IA.
+- Si el humano dice "no saludó adecuadamente", devuelve el ID del criterio de Saludo.
+- Si se queja de un "mal tono de voz", devuelve el ID de Tono de Voz.
+- Si el comentario es tan genérico que afecta a toda la llamada o no se puede aislar en criterios específicos, devuelve arreglo vacío [].
+- Devuelve SOLO una matriz JSON con los IDs numéricos, sin texto adicional.
+
+Responde únicamente: { "affected_ids": [1, 5] }`;
+
+  try {
+    const { result } = await callAI(prompt, "Detecta los IDs afectados");
+    return Array.isArray(result.affected_ids) ? result.affected_ids.map(Number) : [];
+  } catch (err) {
+    console.error('[B2B Agent] Error detecting affected criteria:', err.message);
+    return []; 
+  }
+}
+
 async function distillFeedback(rawFeedback, aiConfig) {
   const { callAI } = createAIClient(aiConfig, 'auditor');
   const prompt = `Extrae la REGLA GENERAL de este feedback de auditoría, eliminando detalles específicos de audios (tiempos, nombres). Si no hay valor instructivo responde NO_VALOR.
@@ -936,6 +1027,63 @@ Feedback: "${rawFeedback}"`;
     const text = distilled.regla || distilled.rule || distilled.resumen || distilled.feedback || (typeof distilled === 'string' ? distilled : JSON.stringify(distilled));
     return (text.trim() === 'NO_VALOR' || text.length < 5) ? null : text.trim();
   } catch (e) { return null; }
+}
+
+/**
+ * AI-powered template refinement: takes a criterion's current description + human correction
+ * and generates an ADDENDUM to enrich the description. NEVER removes existing text.
+ * Returns { addendum: string, wasUseful: boolean } or null on error.
+ */
+async function refineTemplateDescription(currentDescription, criterionName, humanFeedback, aiConfig) {
+  if (!humanFeedback || !humanFeedback.trim()) return null;
+
+  // Fast deduplication: skip if >70% of feedback words already in description
+  const descWords = new Set(normalizeName(currentDescription).split(/\s+/).filter(w => w.length > 3));
+  const feedbackWords = normalizeName(humanFeedback).split(/\s+/).filter(w => w.length > 3);
+  if (feedbackWords.length > 0) {
+    const overlap = feedbackWords.filter(w => descWords.has(w)).length;
+    if (overlap / feedbackWords.length > 0.7) {
+      return { addendum: '', wasUseful: false };
+    }
+  }
+
+  const { callAI } = createAIClient(aiConfig, 'filter');
+
+  const prompt = `Eres un especialista en diseño de rúbricas de evaluación de calidad para call centers.
+
+CRITERIO: "${criterionName}"
+DESCRIPCIÓN ACTUAL:
+"""
+${currentDescription}
+"""
+
+CORRECCIÓN DEL AUDITOR HUMANO:
+"""
+${humanFeedback}
+"""
+
+TAREA: Analiza la corrección y genera texto NUEVO para AGREGAR a la descripción del criterio.
+
+REGLAS ESTRICTAS:
+1. NO repitas nada que ya esté en la descripción actual — léela completa antes de responder.
+2. NO elimines ni reformules texto existente — solo genera un ADDENDUM nuevo.
+3. Extrae: nuevos escenarios, excepciones, aclaraciones de borde, o ejemplos concretos que enriquezcan la regla.
+4. Si la corrección es muy específica a un audio particular (nombres propios, tiempos exactos, números de cuenta) y no aporta una regla general reutilizable → responde { "addendum": "", "wasUseful": false }.
+5. Si lo que dice la corrección ya está cubierto por la descripción existente → responde { "addendum": "", "wasUseful": false }.
+6. Máximo 1-3 oraciones concisas. Mismo estilo y tono que la descripción existente.
+7. Inicia con un marcador según corresponda: "ESCENARIO ADICIONAL:", "EXCEPCIÓN:", "EJEMPLO:", "ACLARACIÓN:".
+
+Responde ÚNICAMENTE JSON: { "addendum": "texto a agregar o cadena vacía", "wasUseful": true/false }`;
+
+  try {
+    const { result } = await callAI(prompt, 'Genera addendum para criterio de evaluación.');
+    const addendum = result.addendum || '';
+    const wasUseful = result.wasUseful === true && addendum.trim().length > 10;
+    return { addendum: addendum.trim(), wasUseful };
+  } catch (err) {
+    console.error(`[B2B Agent] refineTemplateDescription error:`, err.message);
+    return null;
+  }
 }
 
 async function distillFilterFeedback(rawFeedback, aiConfig) {
@@ -973,10 +1121,14 @@ module.exports = {
   analyzeInteraction,
   reprocessInteraction,
   selectiveReprocessInteraction,
+  detectAffectedCriteriaByFeedback,
   generateSystemPrompt,
   suggestAgentName,
   distillFeedback,
   distillFilterFeedback,
+  refineTemplateDescription,
+  findDescriptionKey,
+  findCriterionNameKey,
   normalizeName,
   buildFullPromptV2,
   buildFullPrompt,

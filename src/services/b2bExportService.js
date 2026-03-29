@@ -638,6 +638,29 @@ function matchCriterionToColumn(colName, criterios) {
 }
 
 /**
+ * Fuzzy lookup a value from an object using normalized key matching.
+ * Handles accent, case, and whitespace differences between template columns and AI keys.
+ */
+function fuzzyLookup(obj, key) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  // 1. Exact match
+  if (obj[key] !== undefined) return obj[key];
+  // 2. Normalized match
+  const normKey = normalizeForMatch(key);
+  for (const k of Object.keys(obj)) {
+    if (normalizeForMatch(k) === normKey) return obj[k];
+  }
+  // 3. Substring match (template col is shorter name of AI key or vice versa)
+  if (normKey.length >= 5) {
+    for (const k of Object.keys(obj)) {
+      const normK = normalizeForMatch(k);
+      if (normK.length >= 5 && (normK.includes(normKey) || normKey.includes(normK))) return obj[k];
+    }
+  }
+  return undefined;
+}
+
+/**
  * Build entregable object from criterios + deliverable template columns.
  * Returns { colName: "SI"/"NO"/value } for each non-metadata column.
  */
@@ -698,6 +721,22 @@ function buildEntregableFromCriterios(row, columns) {
 
     // If no match in available, try all criterios
     if (!criterion) criterion = matchCriterionToColumn(col, criterios);
+
+    // Fallback: try matching by positional order (column position maps to criterion order)
+    if (!criterion && criterios.length > 0) {
+      const nonMetaCols = columns.filter(c => autoFillMetadata(c, row, 0) === null
+        && !normalizeForMatch(c).includes('puntaje') && !normalizeForMatch(c).includes('porcentaje')
+        && !normalizeForMatch(c).includes('calificacion') && normalizeForMatch(c) !== '%'
+        && !normalizeForMatch(c).includes('comentario') && !normalizeForMatch(c).includes('observacion')
+        && !normalizeForMatch(c).includes('resumen') && !normalizeForMatch(c).includes('etiqueta')
+        && !normalizeForMatch(c).includes('motivo') && !normalizeForMatch(c).includes('momento')
+        && !normalizeForMatch(c).includes('usuario') && !normalizeForMatch(c).includes('cuenta')
+      );
+      const colIdx = nonMetaCols.indexOf(col);
+      if (colIdx >= 0 && colIdx < criterios.length) {
+        criterion = criterios[colIdx];
+      }
+    }
 
     if (criterion) {
       entregable[col] = criterion.cumple ? 'SI' : 'NO';
@@ -876,13 +915,15 @@ async function buildTemplateWorkbook(wb, rows, areaName, dateFrom, dateTo, templ
       const col = columns[i];
       const cell = wsRow.getCell(i + 1);
 
-      // Priority: 1) auto-fill metadata, 2) built entregable value, 3) fallback "-"
+      // Priority: 1) auto-fill metadata, 2) built entregable value (fuzzy key match), 3) fallback "-"
       const metaValue = autoFillMetadata(col, row, idx);
       let value;
       if (metaValue !== null) {
         value = metaValue;
       } else {
-        value = entregable[col] !== undefined ? entregable[col] : '-';
+        // Use fuzzy lookup to handle accent/case mismatches between template cols and entregable keys
+        const entVal = fuzzyLookup(entregable, col);
+        value = entVal !== undefined ? entVal : '-';
       }
 
       cell.value = value;
@@ -1032,8 +1073,11 @@ async function buildAutoEntregableWorkbook(wb, rows, areaName, dateFrom, dateTo)
       else if (col === 'Resumen') value = ar.resumen || '-';
       else if (col === 'Revisor') value = row.human_reviewer || (row.status === 'aprobado' ? 'Automatico' : '-');
       else if (col === 'Fecha') value = fmtDate(row.created_at);
-      // Criteria columns from entregable
-      else value = entregable[col] !== undefined ? entregable[col] : '-';
+      // Criteria columns from entregable (fuzzy key match)
+      else {
+        const entVal = fuzzyLookup(entregable, col);
+        value = entVal !== undefined ? entVal : '-';
+      }
 
       cell.value = value;
       applyCellStyle(cell, idx);

@@ -1,7 +1,7 @@
-const { query } = require('../config/database');
+const { query, transaction } = require('../config/database');
 const { decrypt } = require('../utils/encryption');
 const { transcribeAudioFull, diarizeTranscription, remapWhisperXSpeakers, formatVoiceMetrics, formatWhisperXMetrics } = require('./b2bTranscriptionService');
-const { filterInteraction, analyzeInteraction, reprocessInteraction, selectiveReprocessInteraction, distillFeedback } = require('./b2bAgentService');
+const { filterInteraction, analyzeInteraction, reprocessInteraction, selectiveReprocessInteraction, distillFeedback, refineTemplateDescription, findDescriptionKey, findCriterionNameKey, normalizeName } = require('./b2bAgentService');
 const { recordB2bTokenUsage, recordB2bTranscriptionCost } = require('./b2bTokenService');
 
 // ─── B2B Pipeline Orchestrator ──────────────────────────────────
@@ -705,14 +705,47 @@ async function stepReprocess(interactionId, humanFeedback) {
     throw new Error(`No agent found for reprocess: ${agentName}`);
   }
 
-  // Pass full agent object — reprocessInteraction detects v2 vs legacy automatically
-  const agentResult = await reprocessInteraction(
-    interaction.raw_text,
-    agent,
-    interaction.agent_result,
-    humanFeedback,
-    aiConfig
-  );
+  const { detectAffectedCriteriaByFeedback, reprocessInteraction, selectiveReprocessInteraction } = require('./b2bAgentService');
+
+  let agentResult;
+  let affectedIds = [];
+  
+  try {
+    affectedIds = await detectAffectedCriteriaByFeedback(agent, interaction.agent_result, humanFeedback, aiConfig);
+  } catch(e) {
+    console.warn(`[B2B Pipeline] Failed to detect affected criteria: ${e.message}`);
+  }
+
+  if (affectedIds && affectedIds.length > 0) {
+    console.log(`[B2B Pipeline] Smart Reprocess: Detected ${affectedIds.length} affected criteria for feedback — converting to selective_reprocess`);
+    const correctionItems = affectedIds.map(id => ({ id, feedback: humanFeedback }));
+
+    agentResult = await selectiveReprocessInteraction(
+      interaction.raw_text,
+      agent,
+      interaction.agent_result,
+      [], // Auto-locks all criteria NOT in correctionItems
+      correctionItems,
+      aiConfig
+    );
+
+    // Auto-mejora del template para criterios afectados (non-blocking)
+    for (const affectedId of affectedIds) {
+      setImmediate(() => {
+        applyTemplateRefinement(agent.id, affectedId, humanFeedback, aiConfig)
+          .catch(err => console.error(`[B2B Pipeline] Template refinement failed for criterion ${affectedId}:`, err.message));
+      });
+    }
+  } else {
+    console.log(`[B2B Pipeline] Full Reprocess: Could not isolate specific criteria, falling back to full reprocess...`);
+    agentResult = await reprocessInteraction(
+      interaction.raw_text,
+      agent,
+      interaction.agent_result,
+      humanFeedback,
+      aiConfig
+    );
+  }
 
   // Recalculate score using category-weighted formula
   recalculateScoreByCategory(agentResult, agent.evaluation_template);
@@ -843,6 +876,12 @@ async function stepSelectiveReprocess(interactionId, lockedCriteriaIds, correcti
       if (ci.feedback && ci.feedback.trim()) {
         const distilled = await distillFeedback(ci.feedback, aiConfig);
         if (distilled) await accumulateFeedback(agent.id, distilled);
+
+        // Auto-mejora del template: IA enriquece la descripción del criterio (non-blocking)
+        setImmediate(() => {
+          applyTemplateRefinement(agent.id, ci.id, ci.feedback, aiConfig)
+            .catch(err => console.error(`[B2B Pipeline] Template refinement failed for criterion ${ci.id}:`, err.message));
+        });
       }
     }
     console.log(`[B2B Pipeline] Selective feedback accumulated for agent ${agentName}`);
@@ -864,6 +903,117 @@ async function clearAgentFeedback(agentId) {
     `UPDATE b2b_agents SET feedback_accumulated = '', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
     [agentId]
   );
+}
+
+// ─── Template Auto-Refinement (AI-to-AI learning) ─────────────
+
+const MAX_DESCRIPTION_LENGTH = 3000;
+const TEMPLATE_LEARNING_MARKER = '---[Aprendizaje IA]---';
+
+/**
+ * Enrich a criterion's description in the evaluation_template based on human corrections.
+ * Reads the template, calls the AI refinement agent, and APPENDS new insights.
+ * NEVER removes or modifies existing text — only adds.
+ * Non-blocking: designed to be called via setImmediate(), failures are logged but never propagate.
+ */
+async function applyTemplateRefinement(agentId, criterionId, humanFeedback, aiConfig) {
+  try {
+    if (!agentId || !criterionId || !humanFeedback?.trim()) return null;
+
+    console.log(`[B2B Pipeline] Template refinement started for agent ${agentId}, criterion ${criterionId}`);
+
+    // Step 1: Read current template
+    const agentResult = await query(
+      'SELECT evaluation_template FROM b2b_agents WHERE id = $1',
+      [agentId]
+    );
+    const raw = agentResult.rows[0]?.evaluation_template;
+    if (!raw || !raw.trim().startsWith('[')) {
+      console.log(`[B2B Pipeline] Template refinement skipped: no JSON template for agent ${agentId}`);
+      return null;
+    }
+
+    let criteria;
+    try { criteria = JSON.parse(raw); } catch { return null; }
+
+    // Step 2: Find criterion by index (_id = index + 1)
+    const rawIdx = criterionId - 1;
+    if (rawIdx < 0 || rawIdx >= criteria.length) {
+      console.log(`[B2B Pipeline] Template refinement skipped: criterion ${criterionId} out of range (${criteria.length} total)`);
+      return null;
+    }
+    const criterion = criteria[rawIdx];
+
+    // Step 3: Find description field dynamically
+    const keys = Object.keys(criterion);
+    const descKey = findDescriptionKey(keys);
+    if (!descKey) {
+      console.log(`[B2B Pipeline] Template refinement skipped: no description field found in criterion ${criterionId}`);
+      return null;
+    }
+    const currentDesc = String(criterion[descKey] || '');
+
+    // Step 4: Extract criterion name for AI context
+    const nameKey = findCriterionNameKey(keys);
+    const criterionName = nameKey ? String(criterion[nameKey]) : `Criterio #${criterionId}`;
+
+    // Step 5: Check max length guard
+    if (currentDesc.length >= MAX_DESCRIPTION_LENGTH) {
+      console.warn(`[B2B Pipeline] Template refinement skipped (max length ${currentDesc.length} chars) for criterion ${criterionId}`);
+      return { refined: false, reason: 'max_length' };
+    }
+
+    // Step 6: Call AI refinement
+    const refinement = await refineTemplateDescription(currentDesc, criterionName, humanFeedback, aiConfig);
+    if (!refinement || !refinement.wasUseful || !refinement.addendum) {
+      console.log(`[B2B Pipeline] Template refinement skipped (not useful) for criterion ${criterionId}`);
+      return { refined: false, reason: 'not_useful' };
+    }
+
+    // Step 7: Check combined length
+    if (currentDesc.length + refinement.addendum.length + 30 > MAX_DESCRIPTION_LENGTH) {
+      console.warn(`[B2B Pipeline] Template refinement skipped (would exceed max length) for criterion ${criterionId}`);
+      return { refined: false, reason: 'max_length' };
+    }
+
+    // Step 8: Write back with transaction + FOR UPDATE to prevent race conditions
+    await transaction(async (client) => {
+      const fresh = await client.query(
+        'SELECT evaluation_template FROM b2b_agents WHERE id = $1 FOR UPDATE',
+        [agentId]
+      );
+      const freshRaw = fresh.rows[0]?.evaluation_template;
+      if (!freshRaw) return;
+
+      let freshCriteria;
+      try { freshCriteria = JSON.parse(freshRaw); } catch { return; }
+      if (rawIdx >= freshCriteria.length) return;
+
+      const freshCriterion = freshCriteria[rawIdx];
+      const freshDescKey = findDescriptionKey(Object.keys(freshCriterion));
+      if (!freshDescKey) return;
+
+      const freshDesc = String(freshCriterion[freshDescKey] || '');
+
+      // APPEND: add separator only the first time, then stack below it
+      const hasAutoSection = freshDesc.includes(TEMPLATE_LEARNING_MARKER);
+      freshCriterion[freshDescKey] = hasAutoSection
+        ? freshDesc + '\n' + refinement.addendum
+        : freshDesc + '\n' + TEMPLATE_LEARNING_MARKER + '\n' + refinement.addendum;
+
+      await client.query(
+        `UPDATE b2b_agents SET evaluation_template = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [JSON.stringify(freshCriteria), agentId]
+      );
+    });
+
+    console.log(`[B2B Pipeline] Template refined for agent ${agentId}, criterion ${criterionId}: +${refinement.addendum.length} chars`);
+    return { refined: true, addendum: refinement.addendum };
+
+  } catch (err) {
+    console.error(`[B2B Pipeline] Template refinement failed for criterion ${criterionId}:`, err.message);
+    return null;
+  }
 }
 
 // ─── Evaluation History (Memory that survives deletion) ─────────
@@ -1276,5 +1426,6 @@ module.exports = {
   getCriteriaPatterns,
   recalculateScoreByCategory,
   accumulateFeedback,
+  applyTemplateRefinement,
   getFilterAgent
 };

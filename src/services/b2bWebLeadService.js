@@ -234,7 +234,7 @@ async function checkCoverage(b2bClientId, lat, lng, _retried = false) {
             };
         }
 
-        const covered = !!(
+        let covered = !!(
             data.covered ||
             data.has_coverage ||
             data.available ||
@@ -246,7 +246,23 @@ async function checkCoverage(b2bClientId, lat, lng, _retried = false) {
         );
 
         // Extract rich coverage details from nested response
+        // Xtrim response: data.data.data = actual coverage object
         const coverageDetails = innerData.data || innerData || {};
+        const nodes = coverageDetails.nodes || [];
+
+        // Technology is per-node: "GPON" (fiber) or "HFC" (cable hybrid)
+        // sectorType = "URBANO"/"RURAL" — zone type, NOT network technology
+        const nodeTechnology = nodes[0]?.technology || null;
+
+        // ── GPON-only filter: HFC zones are NOT eligible for fiber contracts ──
+        // API returns code=0 for both GPON and HFC — we must filter HFC out here
+        if (covered && nodeTechnology && nodeTechnology.toUpperCase() === 'HFC') {
+            console.log(`[B2B Web Lead] Coverage BLOCKED — node technology is HFC (not GPON). Location: ${coverageDetails.city || 'unknown'}, node: ${nodes[0]?.nodeName}`);
+            covered = false;
+        }
+
+        // availableNaps: for GPON it's an object {availability, distance, subnetwork}, for HFC it's null
+        const availableNaps = nodes[0]?.availableNaps || null;
 
         return {
             covered,
@@ -256,10 +272,11 @@ async function checkCoverage(b2bClientId, lat, lng, _retried = false) {
                 cityId: coverageDetails.cityId || null,
                 province: coverageDetails.province || null,
                 sector: coverageDetails.sector || null,
-                sectorType: coverageDetails.sectorType || null,
+                sectorType: coverageDetails.sectorType || null, // "URBANO"/"RURAL"
+                nodeTechnology,                                  // "GPON" or "HFC"
                 subSector: coverageDetails.subSector || null,
-                nodes: coverageDetails.nodes || [],
-                availableNaps: coverageDetails.nodes?.[0]?.availableNaps || null,
+                nodes,
+                availableNaps,
                 message: data.message || coverageDetails.message || null,
                 externalTransactionId: coverageDetails.externalTransactionId || null,
             },

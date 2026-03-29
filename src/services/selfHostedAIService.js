@@ -112,9 +112,8 @@ async function healthCheck() {
   const start = Date.now();
   try {
     // vLLM health endpoint — try /health first, fallback to /v1/models
-    let response;
     try {
-      response = await axios.get(`${SELF_HOSTED_API_URL}/health`, {
+      await axios.get(`${SELF_HOSTED_API_URL}/health`, {
         headers: getHeaders(),
         timeout: 10000,
       });
@@ -123,7 +122,7 @@ async function healthCheck() {
       const modelsUrl = SELF_HOSTED_API_URL.endsWith('/v1')
         ? `${SELF_HOSTED_API_URL}/models`
         : `${SELF_HOSTED_API_URL}/v1/models`;
-      response = await axios.get(modelsUrl, {
+      await axios.get(modelsUrl, {
         headers: getHeaders(),
         timeout: 10000,
       });
@@ -221,13 +220,17 @@ async function chatCompletionStream(params = {}) {
     throw new Error('SELF_HOSTED_API_URL not configured');
   }
 
-  const maxOutputTokens = Math.min(params.max_tokens || 500, 1800);
+  // B2C chat → cap 1800 tokens output (respuestas rápidas, no necesitan más)
+  // B2B analysis → cap 4500 tokens output (JSON con 30+ criterios + observaciones detalladas)
+  // El modelo tiene --max-model-len 9800. Nunca exceder ese total.
+  const isLargeJob = (params.max_tokens || 500) >= 3000;
+  const maxOutputTokens = Math.min(params.max_tokens || 500, isLargeJob ? 4500 : 1800);
 
-  // Smart truncation: if input is too long, keep start + end of the longest message
-  // Assumes ~3.5 chars per token for Spanish. Budget: 7000 - maxOutputTokens - 200 buffer.
-  // 7000 input + 1800 output = 8800 tokens total — well within Qwen2.5-72B 32k context
-  // Smaller budget = less prefill time = faster first token
-  const maxInputChars = (7000 - maxOutputTokens - 200) * 3.5;
+  // Budget de input: modelo tiene 9800 tokens en total.
+  // B2C: presupuesto conservador de 7000 input + 1800 output = 8800 (rápido, menos prefill)
+  // B2B: presupuesto ampliado de 9000 input budget - 4500 output = 4500 tokens input (director prompt cabe en ~13000 chars)
+  const MODEL_BUDGET = isLargeJob ? 9000 : 7000;
+  const maxInputChars = (MODEL_BUDGET - maxOutputTokens - 200) * 3.5;
   const messages = params.messages ? [...params.messages] : [];
   const totalChars = messages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
   if (totalChars > maxInputChars) {

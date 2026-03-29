@@ -12,6 +12,7 @@ const { query } = require('../config/database');
 async function getClientConfig(req, res) {
     try {
         const clientId = req.b2bClient.id;
+        await query('SET search_path TO chatbot_saas, public');
         const result = await query(
             'SELECT welcome_message, widget_color, widget_position FROM b2b_web_configs WHERE b2b_client_id = $1',
             [clientId]
@@ -27,6 +28,7 @@ async function updateClientConfig(req, res) {
     try {
         const clientId = req.b2bClient.id;
         const { widget_color, widget_position, welcome_message } = req.body;
+        await query('SET search_path TO chatbot_saas, public');
 
         // Upsert config safe fields for the client
         const existing = await query('SELECT id FROM b2b_web_configs WHERE b2b_client_id = $1', [clientId]);
@@ -55,6 +57,7 @@ async function updateClientConfig(req, res) {
 async function getDashboardStats(req, res) {
     try {
         const clientId = req.b2bClient.id; // from b2bAuthenticate middleware
+        await query('SET search_path TO chatbot_saas, public');
 
         // Count total conversations (only those where the visitor actually sent a message)
         const convRes = await query(
@@ -101,6 +104,7 @@ async function getClientConversations(req, res) {
         const { page = 1, limit = 50 } = req.query;
         const offset = (page - 1) * limit;
 
+        await query('SET search_path TO chatbot_saas, public');
         const result = await query(
             `SELECT c.*, 
               (SELECT COUNT(*) FROM b2b_web_messages m WHERE m.conversation_id = c.id) as message_count,
@@ -109,6 +113,8 @@ async function getClientConversations(req, res) {
               c.location_lng as user_lng
            FROM b2b_web_conversations c
            WHERE c.b2b_client_id = $1
+           AND c.deleted_at IS NULL
+           AND c.status = 'active'
            AND EXISTS (SELECT 1 FROM b2b_web_messages m2 WHERE m2.conversation_id = c.id AND m2.role = 'user')
            ORDER BY c.created_at DESC
            LIMIT $2 OFFSET $3`,
@@ -118,6 +124,8 @@ async function getClientConversations(req, res) {
         const countResult = await query(
             `SELECT COUNT(*) as total FROM b2b_web_conversations c 
              WHERE c.b2b_client_id = $1 
+             AND c.deleted_at IS NULL
+             AND c.status = 'active'
              AND EXISTS (SELECT 1 FROM b2b_web_messages m2 WHERE m2.conversation_id = c.id AND m2.role = 'user')`,
             [clientId]
         );
@@ -142,6 +150,7 @@ async function getClientConversationDetails(req, res) {
         const clientId = req.b2bClient.id;
         const { convId } = req.params;
 
+        await query('SET search_path TO chatbot_saas, public');
         const convResult = await query(
             'SELECT * FROM b2b_web_conversations WHERE id = $1 AND b2b_client_id = $2',
             [convId, clientId]
@@ -169,10 +178,58 @@ async function getClientConversationDetails(req, res) {
     }
 }
 
+async function archiveConversation(req, res) {
+    try {
+        const clientId = req.b2bClient.id;
+        const { convId } = req.params;
+        console.log(`[B2B Web Client] Archiving conversation ${convId} for client ${clientId}`);
+
+        await query('SET search_path TO chatbot_saas, public');
+        const result = await query(
+            "UPDATE b2b_web_conversations SET status = 'archived', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND b2b_client_id = $2 RETURNING id",
+            [convId, clientId]
+        );
+
+        if (!result.rows[0]) {
+            return res.status(404).json({ success: false, error: 'Conversation not found' });
+        }
+
+        res.json({ success: true, message: 'Conversación archivada' });
+    } catch (error) {
+        console.error('[B2B Web Client] archiveConversation error:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+}
+
+async function deleteConversation(req, res) {
+    try {
+        const clientId = req.b2bClient.id;
+        const { convId } = req.params;
+        console.log(`[B2B Web Client] Deleting conversation ${convId} for client ${clientId}`);
+
+        await query('SET search_path TO chatbot_saas, public');
+        const result = await query(
+            "UPDATE b2b_web_conversations SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND b2b_client_id = $2 RETURNING id",
+            [convId, clientId]
+        );
+
+        if (!result.rows[0]) {
+            return res.status(404).json({ success: false, error: 'Conversation not found' });
+        }
+
+        res.json({ success: true, message: 'Conversación eliminada' });
+    } catch (error) {
+        console.error('[B2B Web Client] deleteConversation error:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+}
+
 module.exports = {
     getDashboardStats,
     getClientConversations,
     getClientConfig,
     updateClientConfig,
-    getClientConversationDetails
+    getClientConversationDetails,
+    archiveConversation,
+    deleteConversation
 };

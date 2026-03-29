@@ -7,6 +7,7 @@
 
 const { query } = require('../config/database');
 const { processMessage } = require('../services/b2bWebChatService');
+const { reverseGeocode } = require('../utils/geocoding');
 
 /**
  * GET /api/v1/b2b-web/widget/:clientId/config
@@ -182,19 +183,35 @@ async function getMessages(req, res) {
  */
 async function saveLocation(req, res) {
     try {
-        const { convId } = req.params;
-        const { lat, lng, city, address } = req.body;
+        const { clientId, convId } = req.params;
+        let { lat, lng, city, address } = req.body;
 
         if (!lat || !lng) {
             return res.status(400).json({ success: false, error: 'lat and lng are required' });
         }
 
+        // --- Reverse Geocoding Integration ---
+        if (!city || !address) {
+            console.log(`[B2B Web Widget] Reverse geocoding for ${lat}, ${lng}...`);
+            
+            // Get Google Maps API key from config if available
+            const configRes = await query(
+                'SELECT google_maps_api_key FROM b2b_web_configs WHERE b2b_client_id = $1',
+                [clientId]
+            );
+            const apiKey = configRes.rows[0]?.google_maps_api_key;
+            
+            const geo = await reverseGeocode(lat, lng, apiKey);
+            if (geo.city) city = geo.city;
+            if (geo.address) address = geo.address;
+        }
+
         await query(
             `UPDATE b2b_web_conversations 
-       SET location_lat = $1, location_lng = $2, location_city = $3, location_address = $4,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5`,
-            [lat, lng, city || null, address || null, convId]
+             SET location_lat = $1, location_lng = $2, location_city = $3, location_address = $4,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5 AND b2b_client_id = $6`,
+            [lat, lng, city || null, address || null, convId, clientId]
         );
 
         res.json({ success: true, data: { lat, lng, city, address } });
